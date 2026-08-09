@@ -71,8 +71,8 @@ fn rotate_vault_key_keeps_items_decryptable() {
     let created = create_vault_keys("pw").unwrap();
     let blob = encrypt_item(b"persistent secret", &created.unlocked).unwrap();
 
-    let (new_keyset, new_unlocked) =
-        rotate_vault_key(&created.unlocked, &created.encrypted).unwrap();
+    let (new_keyset, new_unlocked, _) =
+        rotate_vault_key(&created.unlocked, &created.encrypted, None).unwrap();
 
     let decrypted = decrypt_item(&blob, &new_unlocked).unwrap();
     assert_eq!(decrypted.as_slice(), b"persistent secret");

@@ -4,6 +4,7 @@
 //! 解锁后得到 [`UnlockedVault`](密钥常驻内存,zeroize on drop)。
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::aead::{unwrap_key, wrap_key, WrappedKey};
 use crate::error::{CryptoError, Result};
@@ -217,15 +218,28 @@ pub fn change_master_password(
 /// IKEK 自身**密钥不变**,因此所有 item 的 wrapped_item_key 与密文都不需要改 ——
 /// 这正是引入 VMK / IKEK 两层的好处。
 ///
-/// 调用方:本函数返回的 [`EncryptedKeySet`] 应替换持久化的旧版本,
-/// 同时获得一份新的 [`UnlockedVault`](VMK 已替换,KEK / IKEK 不变)。
+/// **signing seed 一并原子重包**:signing seed 由 VMK 包裹,旋转 VMK 会让旧
+/// 包裹解不开。调用方把当前 `wrapped_signing_seed`(若启用了签名)传进来,本函数
+/// 用旧 VMK 解、新 VMK 重包,随新 keyset 一起返回 —— 杜绝"旋转后 seed 孤儿化"。
+/// 未启用签名传 `None`。
+///
+/// 调用方:返回的 [`EncryptedKeySet`] 与(可选)新 wrapped signing seed 应作为一个
+/// 整体替换持久化的旧版本,同时获得一份新的 [`UnlockedVault`](VMK 已替换,
+/// KEK / IKEK 不变)。
 pub fn rotate_vault_key(
     unlocked: &UnlockedVault,
     current: &EncryptedKeySet,
-) -> Result<(EncryptedKeySet, UnlockedVault)> {
+    wrapped_signing_seed: Option<&WrappedKey>,
+) -> Result<(EncryptedKeySet, UnlockedVault, Option<WrappedKey>)> {
     if current.account_id != unlocked.account_id || current.vault_id != unlocked.vault_id {
         return Err(CryptoError::InvalidArgument("keyset/vault id mismatch"));
     }
+
+    // signing seed 先用**旧** VMK 解出来(在生成新 VMK 之前,unlocked 仍持旧 VMK)。
+    let signing_seed = match wrapped_signing_seed {
+        Some(w) => Some(unwrap_signing_seed(unlocked, w)?),
+        None => None,
+    };
 
     let new_vmk = VaultMasterKey::generate()?;
 
@@ -263,7 +277,13 @@ pub fn rotate_vault_key(
         )?),
     };
 
-    Ok((next_keyset, next_unlocked))
+    // 用**新** VMK 重包 signing seed。
+    let rewrapped_signing_seed = match signing_seed {
+        Some(seed) => Some(wrap_signing_seed(&next_unlocked, &seed)?),
+        None => None,
+    };
+
+    Ok((next_keyset, next_unlocked, rewrapped_signing_seed))
 }
 
 // ---------- 生物识别 ----------
@@ -294,7 +314,8 @@ pub struct BiometricEnvelope {
 /// `enable_biometric_unlock` 的返回值。
 pub struct BiometricUnlockSetup {
     /// 32 字节随机 wrapper_key,**调用方必须存到 OS keychain**(生物识别保护),不要写应用磁盘。
-    pub wrapper_key: [u8; 32],
+    /// `Zeroizing`:交给 keychain 后本副本 drop 即擦除。
+    pub wrapper_key: Zeroizing<[u8; 32]>,
     /// 持久化的信封,存到磁盘。
     pub envelope: BiometricEnvelope,
 }
@@ -320,7 +341,7 @@ pub fn enable_biometric_unlock(unlocked: &UnlockedVault) -> Result<BiometricUnlo
         &aad_for_biometric(&unlocked.vault_id),
     )?;
     Ok(BiometricUnlockSetup {
-        wrapper_key: wrapper_bytes,
+        wrapper_key: Zeroizing::new(wrapper_bytes),
         envelope: BiometricEnvelope {
             version: KEYSET_FORMAT_VERSION,
             vault_id: unlocked.vault_id,
@@ -432,7 +453,9 @@ fn aad_for_signing_seed(vault_id: &Id) -> Vec<u8> {
     out
 }
 
-/// 用 VMK 包装 Ed25519 signing-key 的 32 字节 seed,用于持久化到 `vault.json`。
+/// 用 VMK 包装 Ed25519 signing-key 的 32 字节 seed。密文与其它 wrapped 密钥
+/// 同处持久化在 vault 目录的密钥残余文件里,**不**落 `vault.json`(后者只放
+/// 无密钥的明文元数据);具体落盘文件由上层 vault 管理层决定。
 ///
 /// AAD 绑定 vault_id 防止跨 vault 张冠李戴。专用 label `wrap-signing-seed/v1`
 /// 防止与其他 wrap-* AEAD 上下文混淆。
@@ -444,17 +467,17 @@ pub fn wrap_signing_seed(
     crate::aead::wrap_key(&unlocked.vmk.0, &key, &aad_for_signing_seed(&unlocked.vault_id))
 }
 
-/// 用 VMK 解开包装,返回 32 字节 signing seed。
+/// 用 VMK 解开包装,返回 32 字节 signing seed(`Zeroizing`,用后自动擦除)。
 pub fn unwrap_signing_seed(
     unlocked: &UnlockedVault,
     wrapped: &crate::aead::WrappedKey,
-) -> Result<[u8; 32]> {
+) -> Result<Zeroizing<[u8; 32]>> {
     let key = crate::aead::unwrap_key(
         &unlocked.vmk.0,
         wrapped,
         &aad_for_signing_seed(&unlocked.vault_id),
     )?;
-    let mut out = [0u8; 32];
+    let mut out = Zeroizing::new([0u8; 32]);
     out.copy_from_slice(key.expose_secret());
     Ok(out)
 }
@@ -531,8 +554,9 @@ mod tests {
     #[test]
     fn rotate_vault_key_invalidates_old_wrapped_vmk() {
         let created = create_vault_keys("pw").unwrap();
-        let (next, next_unlocked) =
-            rotate_vault_key(&created.unlocked, &created.encrypted).unwrap();
+        let (next, next_unlocked, seed) =
+            rotate_vault_key(&created.unlocked, &created.encrypted, None).unwrap();
+        assert!(seed.is_none());
 
         assert_ne!(next.wrapped_vmk, created.encrypted.wrapped_vmk);
         let after = unlock_vault("pw", &next).unwrap();
@@ -541,6 +565,28 @@ mod tests {
             after.ikek.expose_secret(),
             created.unlocked.ikek.expose_secret()
         );
+    }
+
+    /// 旋转 VMK 时传入 signing seed:必须原子重包,旋转后仍能用新 VMK 解出**同一** seed。
+    #[test]
+    fn rotate_vault_key_rewraps_signing_seed() {
+        let created = create_vault_keys("pw").unwrap();
+        let seed = [0x37u8; 32];
+        let wrapped = wrap_signing_seed(&created.unlocked, &seed).unwrap();
+
+        let (next, next_unlocked, rewrapped) =
+            rotate_vault_key(&created.unlocked, &created.encrypted, Some(&wrapped)).unwrap();
+        let rewrapped = rewrapped.expect("signing seed should be re-wrapped");
+
+        // 旧包裹在新 VMK 下解不开(证明 VMK 确实换了)
+        assert!(unwrap_signing_seed(&next_unlocked, &wrapped).is_err());
+        // 新包裹在新 VMK 下解出同一 seed
+        let recovered = unwrap_signing_seed(&next_unlocked, &rewrapped).unwrap();
+        assert_eq!(&*recovered, &seed);
+        // 重启解锁后同样成立
+        let after = unlock_vault("pw", &next).unwrap();
+        let recovered2 = unwrap_signing_seed(&after, &rewrapped).unwrap();
+        assert_eq!(&*recovered2, &seed);
     }
 
     #[test]
@@ -677,7 +723,7 @@ mod tests {
     fn rotate_rejects_id_mismatch() {
         let a = create_vault_keys("a").unwrap();
         let b = create_vault_keys("b").unwrap();
-        let r = rotate_vault_key(&a.unlocked, &b.encrypted);
+        let r = rotate_vault_key(&a.unlocked, &b.encrypted, None);
         assert!(matches!(r, Err(CryptoError::InvalidArgument(_))));
     }
 

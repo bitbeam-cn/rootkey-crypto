@@ -50,7 +50,7 @@ Master Password(用户记忆,UI 强制 ≥ 12 位 + zxcvbn ≥ 3)
 | 密钥包裹 | AES-256-GCM | 随机 96-bit nonce,AAD 绑定层级与格式版本 |
 | 条目加密 | XChaCha20-Poly1305 | 随机 192-bit nonce |
 | 文件签名 | Ed25519 | vault manifest 防篡改/回滚 |
-| 共享密封 | X25519 ECDH + XChaCha20-Poly1305 | nonce = BLAKE3(epk ‖ rcpt_pk)[..24] |
+| 共享密封 | X25519 ECDH → BLAKE3 KDF → XChaCha20-Poly1305 | ECDH 输出经 BLAKE3::derive_key 派生密钥(非裸用)+ 校验 was_contributory 拒低阶点;nonce = BLAKE3(epk ‖ rcpt_pk)[..24] |
 | 口令预处理 | NFKD 归一化 | 跨平台输入一致性 |
 
 完整规约见 [`docs/SECURITY_MODEL.md`](docs/SECURITY_MODEL.md)(红线、AAD 模板、错误处理、回归保护)。
@@ -62,7 +62,7 @@ Master Password(用户记忆,UI 强制 ≥ 12 位 + zxcvbn ≥ 3)
 派生流程没有私货。这些向量同时被本仓测试(`tests/`)锁定,CI 里任何偏离都会红。
 
 ```bash
-cargo test          # 161 个测试,含 KAT 向量与跨语言契约
+cargo test          # 165 个测试,含 KAT 向量与跨语言契约
 ```
 
 ## 文档

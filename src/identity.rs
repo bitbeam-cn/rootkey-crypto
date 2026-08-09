@@ -7,9 +7,12 @@
 //! - **Ed25519 keypair**:用于签名 `members.json` / `identities/<user>.json`
 //!   (admin 改 members 时签;成员验签确认 members.json 真由 admin 改)
 //!
-//! 两套 keypair 一起本地落盘(`identity.secret.enc`),由主密码派生的 MUK
-//! 子密钥包装。新设备 `bootstrap_vault_from_sync` 走完后立即解 `identity.secret.enc`
-//! 拿到 sk,无需另外 KDF。
+//! 两套 keypair 一起本地落盘(`identity.secret.enc`),由该 vault 的 **KEK** 包装。
+//! 选 KEK 作锚点是关键:KEK 跨改主密码不变(改密码只重包 KEK,不改其值),ADR-010
+//! 账户模型下旋转 ARK 也只重包 KEK、其值同样不变 —— 因此身份密钥**既不随主密码
+//! 轮换失效,也不随 ARK 旋转失效**,是全链路最稳的锚。改密码 / 恢复密钥重设 / ARK
+//! 旋转后,身份及其共享 vault 成员资格照常存活。解锁 vault 拿到 KEK 后即可解
+//! `identity.secret.enc`,无需另外 KDF。
 //!
 //! ## 文件格式(`identity.secret.enc`)
 //!
@@ -17,8 +20,8 @@
 //!
 //! ```text
 //! plaintext = x25519_seed(32B) || ed25519_seed(32B)
-//! key       = MUK
-//! aad       = b"root-key/identity-secret/v1" || account_id_bytes(16B)
+//! key       = KEK(该 vault 的 Key Encryption Key)
+//! aad       = b"root-key/identity-secret/v2" || account_id_bytes(16B)
 //! envelope  = SealedBlob { nonce(24B), ciphertext(64+16=80B) }
 //! ```
 //!
@@ -32,12 +35,13 @@ use zeroize::Zeroizing;
 
 use crate::aead::{open_blob, seal_blob, SealedBlob};
 use crate::error::{CryptoError, Result};
-use crate::keys::MasterUnlockKey;
 use crate::shared_vault::{SharedIdentityKeyPair, X25519_PUBLIC_KEY_LEN, X25519_SECRET_KEY_LEN};
 use crate::signing::{SigningKey, VerifyingKey};
+use crate::vault::UnlockedVault;
 
 /// AAD 域分隔(identity 加密专用,与其它 AEAD 用法隔离)。
-const IDENTITY_DOMAIN: &[u8] = b"root-key/identity-secret/v1";
+/// v2:包裹密钥从 MUK 迁到 KEK(跨改密码 / ARK 旋转均不变),旧 v1(MUK 包裹)不再产出。
+const IDENTITY_DOMAIN: &[u8] = b"root-key/identity-secret/v2";
 
 /// Ed25519 seed 字节长度(SigningKey::expose_seed 返回 32B)。
 pub const ED25519_SEED_LEN: usize = 32;
@@ -99,22 +103,19 @@ impl Identity {
         fingerprint_from_pubkeys(&self.x25519_public(), &self.ed25519_public().to_bytes())
     }
 
-    /// 把身份 sk 用 MUK 包装成 [`WrappedIdentity`] —— 调用方落盘。
+    /// 把身份 sk 用该 vault 的 **KEK** 包装成 [`WrappedIdentity`] —— 调用方落盘。
     ///
-    /// `account_id` 必须与 vault 的 account_id 一致,作为 AAD 一部分防 cross-account
-    /// 把别人的 identity envelope 灌进来当自己的。
-    pub fn wrap_with_muk(
-        &self,
-        muk: &MasterUnlockKey,
-        account_id: &[u8; 16],
-    ) -> Result<WrappedIdentity> {
+    /// 用 KEK(而非 MUK)包装是关键:KEK 跨改密码 / ARK 旋转不变,身份因此不随
+    /// 主密码轮换或 ARK 旋转失效。`vault` 的 `account_id` 进 AAD,防 cross-account
+    /// 把别人的 identity envelope 灌进来当自己的(KEK 不同本身也已失败,双保险)。
+    pub fn wrap_with_vault(&self, vault: &UnlockedVault) -> Result<WrappedIdentity> {
         // 64B plaintext = x25519_seed(32B) || ed25519_seed(32B)
         let mut plaintext = Zeroizing::new(Vec::with_capacity(64));
         plaintext.extend_from_slice(self.x25519.expose_secret_for_identity_wrap());
-        plaintext.extend_from_slice(&self.ed25519.expose_seed());
+        plaintext.extend_from_slice(&self.ed25519.expose_seed()[..]);
 
-        let aad = identity_aad(account_id);
-        let envelope = seal_blob(&muk.0, &plaintext, &aad)?;
+        let aad = identity_aad(&vault.account_id);
+        let envelope = seal_blob(&vault.kek.0, &plaintext, &aad)?;
         Ok(WrappedIdentity {
             schema_version: WRAPPED_IDENTITY_VERSION,
             envelope,
@@ -132,8 +133,8 @@ impl std::fmt::Debug for Identity {
     }
 }
 
-/// 当前 wrapped identity schema 版本。
-pub const WRAPPED_IDENTITY_VERSION: u16 = 1;
+/// 当前 wrapped identity schema 版本。v2 = KEK 包裹(v1 为 MUK 包裹,已废弃)。
+pub const WRAPPED_IDENTITY_VERSION: u16 = 2;
 
 /// 落盘形态 —— `identity.secret.enc` 反序列化目标。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -145,22 +146,18 @@ pub struct WrappedIdentity {
 }
 
 impl WrappedIdentity {
-    /// 用 MUK 解开,返回完整 [`Identity`]。
+    /// 用该 vault 的 **KEK** 解开,返回完整 [`Identity`]。
     ///
     /// 失败情况:
-    /// - 错的 MUK / 错的 account_id → `CryptoError::DecryptFailed`
-    /// - schema 不认 → `CryptoError::UnsupportedSchema`
+    /// - 错的 KEK / 错的 account_id → `CryptoError::DecryptFailed`
+    /// - schema 不认 → `CryptoError::UnsupportedVersion`
     /// - 解开后字节长度不是 64 → `CryptoError::InvalidArgument`
-    pub fn unwrap_with_muk(
-        &self,
-        muk: &MasterUnlockKey,
-        account_id: &[u8; 16],
-    ) -> Result<Identity> {
+    pub fn unwrap_with_vault(&self, vault: &UnlockedVault) -> Result<Identity> {
         if self.schema_version != WRAPPED_IDENTITY_VERSION {
             return Err(CryptoError::UnsupportedVersion(self.schema_version));
         }
-        let aad = identity_aad(account_id);
-        let plaintext = open_blob(&muk.0, &self.envelope, &aad)?;
+        let aad = identity_aad(&vault.account_id);
+        let plaintext = open_blob(&vault.kek.0, &self.envelope, &aad)?;
         if plaintext.len() != X25519_SECRET_KEY_LEN + ED25519_SEED_LEN {
             return Err(CryptoError::InvalidArgument(
                 "identity plaintext length must be 64 bytes",
@@ -213,17 +210,10 @@ fn identity_aad(account_id: &[u8; 16]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kdf::{derive_muk, KdfParams};
+    use crate::vault::{create_vault_keys, UnlockedVault};
 
-    fn dummy_muk() -> MasterUnlockKey {
-        MasterUnlockKey::generate().unwrap()
-    }
-
-    fn dummy_account_id() -> [u8; 16] {
-        [
-            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
-            0x00, 0x00,
-        ]
+    fn dummy_vault() -> UnlockedVault {
+        create_vault_keys("test-password-12chars").unwrap().unlocked
     }
 
     #[test]
@@ -240,11 +230,10 @@ mod tests {
     #[test]
     fn wrap_unwrap_roundtrip() {
         let identity = Identity::generate().unwrap();
-        let muk = dummy_muk();
-        let account = dummy_account_id();
+        let account = dummy_vault();
 
-        let wrapped = identity.wrap_with_muk(&muk, &account).unwrap();
-        let restored = wrapped.unwrap_with_muk(&muk, &account).unwrap();
+        let wrapped = identity.wrap_with_vault(&account).unwrap();
+        let restored = wrapped.unwrap_with_vault(&account).unwrap();
 
         assert_eq!(restored.x25519_public(), identity.x25519_public());
         assert_eq!(
@@ -254,11 +243,30 @@ mod tests {
         assert_eq!(restored.fingerprint(), identity.fingerprint());
     }
 
+    /// 核心回归:改主密码后 KEK 不变,同一 identity envelope 仍可解 ——
+    /// 证明身份不随密码轮换失效(P0 修复点)。
+    #[test]
+    fn identity_survives_password_change() {
+        use crate::vault::{change_master_password, unlock_vault};
+        let created = create_vault_keys("old-password-12ch").unwrap();
+        let identity = Identity::generate().unwrap();
+        let wrapped = identity.wrap_with_vault(&created.unlocked).unwrap();
+
+        // 改密码,得到新 keyset;用新密码解锁得到新会话(KEK 内容不变)
+        let next =
+            change_master_password("old-password-12ch", "new-password-12ch", &created.encrypted)
+                .unwrap();
+        let session = unlock_vault("new-password-12ch", &next).unwrap();
+
+        let restored = wrapped.unwrap_with_vault(&session).unwrap();
+        assert_eq!(restored.x25519_public(), identity.x25519_public());
+    }
+
     #[test]
     fn from_seeds_recovers_same_pubkeys() {
         let identity = Identity::generate().unwrap();
         let x_seed = *identity.x25519.expose_secret_for_identity_wrap();
-        let e_seed = identity.ed25519.expose_seed();
+        let e_seed = *identity.ed25519.expose_seed();
 
         let restored = Identity::from_seeds(x_seed, e_seed);
         assert_eq!(restored.x25519_public(), identity.x25519_public());
@@ -269,56 +277,38 @@ mod tests {
     }
 
     #[test]
-    fn unwrap_with_wrong_muk_fails() {
+    fn unwrap_with_wrong_account_fails() {
         let identity = Identity::generate().unwrap();
-        let muk_a = dummy_muk();
-        let muk_b = dummy_muk();
-        let account = dummy_account_id();
+        let account_a = dummy_vault();
+        let account_b = dummy_vault();
 
-        let wrapped = identity.wrap_with_muk(&muk_a, &account).unwrap();
-        let err = wrapped.unwrap_with_muk(&muk_b, &account).unwrap_err();
-        assert!(matches!(err, CryptoError::DecryptFailed), "got {err:?}");
-    }
-
-    #[test]
-    fn unwrap_with_wrong_account_id_fails() {
-        let identity = Identity::generate().unwrap();
-        let muk = dummy_muk();
-        let acc_a = dummy_account_id();
-        let acc_b: [u8; 16] = [
-            0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x55, 0x55, 0x55,
-            0x55, 0x55,
-        ];
-
-        let wrapped = identity.wrap_with_muk(&muk, &acc_a).unwrap();
-        let err = wrapped.unwrap_with_muk(&muk, &acc_b).unwrap_err();
+        let wrapped = identity.wrap_with_vault(&account_a).unwrap();
+        let err = wrapped.unwrap_with_vault(&account_b).unwrap_err();
         assert!(matches!(err, CryptoError::DecryptFailed), "got {err:?}");
     }
 
     #[test]
     fn schema_mismatch_rejected() {
         let identity = Identity::generate().unwrap();
-        let muk = dummy_muk();
-        let account = dummy_account_id();
+        let account = dummy_vault();
 
-        let mut wrapped = identity.wrap_with_muk(&muk, &account).unwrap();
+        let mut wrapped = identity.wrap_with_vault(&account).unwrap();
         wrapped.schema_version = 99;
-        let err = wrapped.unwrap_with_muk(&muk, &account).unwrap_err();
+        let err = wrapped.unwrap_with_vault(&account).unwrap_err();
         assert!(matches!(err, CryptoError::UnsupportedVersion(99)), "got {err:?}");
     }
 
     #[test]
     fn tampered_envelope_fails_decrypt() {
         let identity = Identity::generate().unwrap();
-        let muk = dummy_muk();
-        let account = dummy_account_id();
+        let account = dummy_vault();
 
-        let mut wrapped = identity.wrap_with_muk(&muk, &account).unwrap();
+        let mut wrapped = identity.wrap_with_vault(&account).unwrap();
         // 翻第一个 ciphertext 字节
         if let Some(b) = wrapped.envelope.ciphertext.first_mut() {
             *b ^= 0xff;
         }
-        let err = wrapped.unwrap_with_muk(&muk, &account).unwrap_err();
+        let err = wrapped.unwrap_with_vault(&account).unwrap_err();
         assert!(matches!(err, CryptoError::DecryptFailed), "got {err:?}");
     }
 
@@ -338,10 +328,9 @@ mod tests {
     fn fingerprint_stable_across_wrap_unwrap() {
         let identity = Identity::generate().unwrap();
         let fp1 = identity.fingerprint();
-        let muk = dummy_muk();
-        let account = dummy_account_id();
-        let wrapped = identity.wrap_with_muk(&muk, &account).unwrap();
-        let restored = wrapped.unwrap_with_muk(&muk, &account).unwrap();
+        let account = dummy_vault();
+        let wrapped = identity.wrap_with_vault(&account).unwrap();
+        let restored = wrapped.unwrap_with_vault(&account).unwrap();
         let fp2 = restored.fingerprint();
         assert_eq!(fp1, fp2);
     }
@@ -371,15 +360,13 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_with_real_kdf_muk() {
-        // 用真实 derive_muk 路径派生 MUK,验证 KDF 输出形态契合
-        let kdf = KdfParams::generate_default().unwrap();
-        let muk = derive_muk("test-password-12chars", &kdf).unwrap();
+    fn round_trip_with_real_account() {
+        // 用真实 create_account 路径拿 ARK,验证 identity 包裹形态契合
         let identity = Identity::generate().unwrap();
-        let account = dummy_account_id();
+        let account = dummy_vault();
 
-        let wrapped = identity.wrap_with_muk(&muk, &account).unwrap();
-        let restored = wrapped.unwrap_with_muk(&muk, &account).unwrap();
+        let wrapped = identity.wrap_with_vault(&account).unwrap();
+        let restored = wrapped.unwrap_with_vault(&account).unwrap();
         assert_eq!(restored.x25519_public(), identity.x25519_public());
     }
 }

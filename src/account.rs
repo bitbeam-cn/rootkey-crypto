@@ -27,6 +27,7 @@
 
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::aead::{unwrap_key, wrap_key, WrappedKey};
 use crate::error::{CryptoError, Result};
@@ -314,6 +315,62 @@ pub fn change_account_password(
     })
 }
 
+/// 旋转账户根密钥 ARK(泄露止损)。
+///
+/// `change_account_password` 是 O(1) 只换 MUK 层、**ARK 不变**;但 ARK 一旦从
+/// 内存泄露,改密码 / 换恢复密钥都救不回(生物识别信封、恢复包裹、identity 包裹
+/// 的都是同一把长命 ARK)。本函数是那个场景的唯一出路:生成**全新 ARK**,把账户
+/// 下每个 vault 的 KEK 从旧 ARK 解出、用新 ARK 重包(O(n),n = vault 数);KEK 以下
+/// (VMK / IKEK / item)完全不动,vault 数据零重写。
+///
+/// **调用方善后(都因为旧包裹绑的是旧 ARK,旋转后失效)**:
+/// 1. 恢复密钥包裹被清空(返回的 keyset `wrapped_ark_recovery = None`)—— 需重新
+///    [`setup_recovery_key`];
+/// 2. 生物识别信封是独立文件、独立包着旧 ARK,crypto 层不会自动作废它 —— 它仍能
+///    解出旧 ARK,但旧 ARK 开不了已重包的 vault(无害却无用)。**调用方必须主动删除
+///    旧信封**并重新 [`enable_account_biometric`];
+/// 3. identity 包裹(`identity.secret.enc`)绑旧 ARK —— 需用返回的
+///    [`UnlockedAccount`] 重新 `Identity::wrap_with_account` 落盘。
+pub fn rotate_account_root_key(
+    password: &str,
+    current: &AccountKeySet,
+) -> Result<(AccountKeySet, UnlockedAccount)> {
+    let old = unlock_account(password, current)?;
+    let new_ark = AccountRootKey::generate()?;
+
+    // 每个 vault 的 KEK:旧 ARK 解 → 新 ARK 重包(AAD 不变,vault_id 绑定保持)。
+    let mut new_vaults = Vec::with_capacity(current.vaults.len());
+    for entry in &current.vaults {
+        let aad = aad_for_vault_kek(&current.account_id, &entry.vault_id);
+        let kek_inner = unwrap_key(&old.ark.0, &entry.wrapped_kek, &aad)?;
+        let rewrapped = wrap_key(&new_ark.0, &kek_inner, &aad)?;
+        new_vaults.push(AccountVaultEntry {
+            vault_id: entry.vault_id,
+            wrapped_kek: rewrapped,
+        });
+    }
+
+    // 新 KDF salt + 新 MUK 包新 ARK。
+    let new_kdf = KdfParams::generate_default()?;
+    let new_muk = derive_muk(password, &new_kdf)?;
+    let wrapped_ark = wrap_key(&new_muk.0, &new_ark.0, &aad_for_ark(&current.account_id, &new_kdf))?;
+
+    let new_keyset = AccountKeySet {
+        version: current.version,
+        account_id: current.account_id,
+        created_at: current.created_at,
+        kdf: new_kdf,
+        wrapped_ark,
+        wrapped_ark_recovery: None, // 旧恢复包裹绑旧 ARK,必须作废重设
+        vaults: new_vaults,
+    };
+    let unlocked = UnlockedAccount {
+        account_id: current.account_id,
+        ark: new_ark,
+    };
+    Ok((new_keyset, unlocked))
+}
+
 // ---------- 恢复密钥(Apple 式 Recovery Key)----------
 
 /// Crockford base32 字符集(去 I/L/O/U 歧义字符)。
@@ -456,8 +513,8 @@ pub struct AccountBiometricEnvelope {
 /// [`enable_account_biometric`] 的返回。`wrapper_key` 必须存 OS keychain
 /// (生物识别保护),`envelope` 落盘。
 pub struct AccountBiometricSetup {
-    /// 32 字节随机 wrapper_key。
-    pub wrapper_key: [u8; 32],
+    /// 32 字节随机 wrapper_key(`Zeroizing`:交给 OS keychain 后本副本 drop 即擦除)。
+    pub wrapper_key: Zeroizing<[u8; 32]>,
     /// 持久化信封。
     pub envelope: AccountBiometricEnvelope,
 }
@@ -472,7 +529,7 @@ pub fn enable_account_biometric(account: &UnlockedAccount) -> Result<AccountBiom
         &aad_for_account_biometric(&account.account_id),
     )?;
     Ok(AccountBiometricSetup {
-        wrapper_key: wrapper_bytes,
+        wrapper_key: Zeroizing::new(wrapper_bytes),
         envelope: AccountBiometricEnvelope {
             version: ACCOUNT_FORMAT_VERSION,
             account_id: account.account_id,
@@ -706,6 +763,55 @@ mod tests {
         assert_eq!(u2.ikek.expose_secret(), v.unlocked.ikek.expose_secret());
         // 恢复密钥依旧有效
         unlock_account_with_recovery_key(&display, &next).unwrap();
+    }
+
+    #[test]
+    fn rotate_ark_survives_vaults_and_invalidates_old_bindings() {
+        let acc = create_account("pw-12characters").unwrap();
+        let v = create_vault_under_account(&acc.unlocked).unwrap();
+        let mut keyset = acc.encrypted.clone();
+        keyset.vaults.push(v.entry.clone());
+        // 旋转前建立恢复密钥 + 生物识别(都绑旧 ARK)
+        let (old_rk, wrapped_rk) = setup_recovery_key(&acc.unlocked).unwrap();
+        keyset.wrapped_ark_recovery = Some(wrapped_rk);
+        let old_bio = enable_account_biometric(&acc.unlocked).unwrap();
+
+        let (next, session) = rotate_account_root_key("pw-12characters", &keyset).unwrap();
+
+        // vault 数据零重写:同密码解锁新 keyset → 同一 ikek 开同一 vault
+        let unlocked = unlock_account_vault(&session, &next.vaults[0], &v.slot).unwrap();
+        assert_eq!(unlocked.ikek.expose_secret(), v.unlocked.ikek.expose_secret());
+        let via_pw = unlock_account("pw-12characters", &next).unwrap();
+        let u2 = unlock_account_vault(&via_pw, &next.vaults[0], &v.slot).unwrap();
+        assert_eq!(u2.ikek.expose_secret(), v.unlocked.ikek.expose_secret());
+
+        // 旧恢复密钥:包裹被清空 → 直接作废
+        assert!(next.wrapped_ark_recovery.is_none());
+        assert!(
+            unlock_account_with_recovery_key(&old_rk, &next).is_err(),
+            "旧恢复密钥必须作废"
+        );
+        // 旧生物识别信封是独立文件、独立包着旧 ARK,crypto 层不交叉校验 keyset,
+        // 因此它仍能"解锁"—— 但解出的是**旧 ARK**,开不了已用新 ARK 重包的 vault。
+        // (所以旋转后调用方必须删掉旧信封;这是卫生要求,不是安全依赖 —— 旧 ARK 已无用。)
+        let stale = unlock_account_via_biometric(&old_bio.wrapper_key, &old_bio.envelope, &next)
+            .expect("旧信封仍解出旧 ARK");
+        assert!(
+            unlock_account_vault(&stale, &next.vaults[0], &v.slot).is_err(),
+            "旋转后旧 ARK 必须开不了重包的 vault"
+        );
+        // wrapped_ark 本身也变了(新 ARK + 新 salt)
+        assert_ne!(next.wrapped_ark, keyset.wrapped_ark);
+        assert_ne!(next.kdf.salt, keyset.kdf.salt);
+    }
+
+    #[test]
+    fn rotate_ark_rejects_wrong_password() {
+        let acc = create_account("correct-pw-12ch").unwrap();
+        assert!(matches!(
+            rotate_account_root_key("wrong-pw", &acc.encrypted),
+            Err(CryptoError::DecryptFailed)
+        ));
     }
 
     #[test]

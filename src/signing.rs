@@ -26,7 +26,7 @@ use ed25519_dalek::{
 };
 use rand_core::{CryptoRng, RngCore};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use zeroize::ZeroizeOnDrop;
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use crate::error::{CryptoError, Result};
 
@@ -56,10 +56,10 @@ impl SigningKey {
 
     /// 暴露 32 字节 seed —— **仅** crate 内部 / vault 持久化层使用。
     ///
-    /// 返回引用的生命周期受 `&self` 约束,`self` Drop 时自动 zeroize。
+    /// 返回 `Zeroizing`:调用方持有期间是明文,drop 时自动擦除,避免拷贝残留内存。
     #[doc(hidden)]
-    pub fn expose_seed(&self) -> [u8; 32] {
-        self.0.to_bytes()
+    pub fn expose_seed(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.0.to_bytes())
     }
 
     /// 对消息字节签名。Ed25519 的 ctx 我们留空(IETF 标准 PureEd25519)。

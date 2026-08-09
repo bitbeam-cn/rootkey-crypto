@@ -6,26 +6,31 @@
 //!
 //! ```text
 //! 1. (esk, epk) = X25519 ephemeral keypair  (32B sk + 32B pk)
-//! 2. shared    = X25519(esk, rpk)              (32B)
-//! 3. nonce     = BLAKE3(domain || epk || rpk)[..24]   (24B)
-//! 4. ct        = XChaCha20-Poly1305(key=shared, nonce, aad=domain, msg=key)
-//! 5. output    = epk(32B) || ct(48B = 32 + 16 tag)
+//! 2. dh        = X25519(esk, rpk)              (32B,须 was_contributory)
+//! 3. key       = BLAKE3::derive_key(kdf_ctx, dh || epk || rpk)  (32B)
+//! 4. nonce     = BLAKE3(domain || epk || rpk)[..24]   (24B)
+//! 5. ct        = XChaCha20-Poly1305(key, nonce, aad=domain, msg=key)
+//! 6. output    = epk(32B) || ct(48B = 32 + 16 tag)
 //! ```
 //!
 //! Open(recipient 用 rsk):
 //!
 //! ```text
 //! 1. epk = output[..32];  ct = output[32..]
-//! 2. shared = X25519(rsk, epk)
-//! 3. nonce  = BLAKE3(domain || epk || pk_from(rsk))[..24]
-//! 4. msg    = XChaCha20-Poly1305 decrypt(key=shared, nonce, aad=domain, ct)
+//! 2. dh  = X25519(rsk, epk)                     (须 was_contributory)
+//! 3. key = BLAKE3::derive_key(kdf_ctx, dh || epk || pk_from(rsk))
+//! 4. nonce  = BLAKE3(domain || epk || pk_from(rsk))[..24]
+//! 5. msg    = XChaCha20-Poly1305 decrypt(key, nonce, aad=domain, ct)
 //! ```
 //!
-//! - **domain**:固定字节串 `b"root-key/shared-vault-key/v1"`,与其它 sealed
-//!   用法隔离;改值需升级 ADR-003 schema 版本
+//! - **KDF(关键)**:ECDH 裸输出**不**直接当 AEAD key —— 过 `BLAKE3::derive_key`
+//!   转成均匀密钥,且绑定 `epk || rpk` 到具体握手;同时两侧都校验
+//!   `was_contributory()` 拒绝低阶点。二者共同挡住"恶意同步 provider 用低阶点
+//!   公钥换掉某成员 → ECDH 输出可预测 → 直接解出 shared_vault_key"这条链路。
+//! - **domain / kdf_ctx**:固定字节串,与其它 sealed 用法隔离;改值需升级 schema 版本
 //! - **AEAD**:XChaCha20-Poly1305(同 vault item 加密)— 已有 dep,符合
 //!   SECURITY_MODEL "不发明算法" 原则
-//! - **nonce 唯一性**:每个 ephemeral keypair fresh 生成 → nonce = H(esk_derived,
+//! - **nonce 唯一性**:每个 ephemeral keypair fresh 生成 → nonce = H(domain, epk,
 //!   rpk) 几乎不可重复(2^192 抗碰撞)
 //!
 //! ## 模型
@@ -39,8 +44,12 @@
 //! ## 不变量
 //!
 //! - **N1**:每次 sealed → fresh ephemeral keypair,不重用
-//! - **N2**:撤销成员 = 重生 shared_vault_key + 重 wrap 给剩余成员 + 重加密
-//!   所有 ItemKey(否则被撤成员用旧 wrap 仍能解旧内容)
+//! - **N2**:撤销成员 = 重生 shared_vault_key + 重 wrap 给剩余成员。这保护
+//!   **撤销之后**新增/更新的条目;**撤销前的旧密文用旧 key 加密,仍可被留有
+//!   旧密文与旧 key 副本的被撤成员解开** —— 这是团队共享库的固有模型(与
+//!   1Password/Bitwarden 组织库一致),不是缺陷。若业务要"硬撤销"到旧内容
+//!   也不可读,须由调用方额外用新 key 重加密所有历史条目(当前不做,见
+//!   [`EncryptedSharedItem`] 的取舍说明)。
 //! - **N3**:owner 必须永久持有自己的 sealed wrap
 //! - **N4**:X25519 keypair 用户层标记 "identity",生命周期 ≥ vault 本身
 //! - **N5**:wrap 数组长度 = recipient 数,无硬上限
@@ -62,8 +71,11 @@ pub const X25519_SECRET_KEY_LEN: usize = 32;
 /// shared_vault_key 字节长度 = SymmetricKey::LEN(32)。
 pub const SHARED_VAULT_KEY_LEN: usize = SymmetricKey::LEN;
 
-/// sealed_box AAD 域分隔。
-const DOMAIN: &[u8] = b"root-key/shared-vault-key/v1";
+/// sealed_box AAD 域分隔。v2:ECDH 输出改经 BLAKE3 KDF(不再裸用)+ contributory 校验。
+const DOMAIN: &[u8] = b"root-key/shared-vault-key/v2";
+
+/// sealed_box 密钥派生 context —— 把 X25519 裸输出转成均匀 AEAD key。
+const SEALED_KDF_CONTEXT: &str = "root-key/shared-vault-sealed/v2";
 
 /// XChaCha20 nonce 长度。
 const NONCE_LEN: usize = 24;
@@ -107,7 +119,7 @@ impl SharedIdentityKeyPair {
         &self.secret
     }
 
-    /// crate-private:给 identity.rs 的 wrap_with_muk 用,把 X25519 secret seed
+    /// crate-private:给 identity.rs 的 wrap_with_vault 用,把 X25519 secret seed
     /// 序列化进 64B identity envelope。**绝不**对 crate 外暴露。
     pub(crate) fn expose_secret_for_identity_wrap(&self) -> &[u8; X25519_SECRET_KEY_LEN] {
         self.secret_bytes()
@@ -244,15 +256,22 @@ pub fn wrap_for_recipient(
     let esk = XSecretKey::from(esk_bytes);
     let epk = XPublicKey::from(&esk).to_bytes();
 
-    // 2. ECDH shared secret
+    // 2. ECDH shared secret(拒低阶点:was_contributory 为假 = rpk 落在小子群,
+    //    ECDH 输出可预测 → 直接失败,不产出 sealed box)
     let rpk = XPublicKey::from(*recipient_pubkey);
     let shared = esk.diffie_hellman(&rpk);
+    if !shared.was_contributory() {
+        return Err(CryptoError::EncryptFailed);
+    }
 
-    // 3. nonce = BLAKE3(domain || epk || rpk)[..24]
+    // 3. KDF:裸 ECDH 输出 → 均匀 AEAD key(绑定 epk||rpk 到本次握手)
+    let aead_key = derive_sealed_key(shared.as_bytes(), &epk, recipient_pubkey);
+
+    // 4. nonce = BLAKE3(domain || epk || rpk)[..24]
     let nonce_bytes = derive_nonce(&epk, recipient_pubkey);
 
-    // 4. AEAD encrypt
-    let cipher = XChaCha20Poly1305::new_from_slice(shared.as_bytes())
+    // 5. AEAD encrypt
+    let cipher = XChaCha20Poly1305::new_from_slice(&*aead_key)
         .map_err(|_| CryptoError::EncryptFailed)?;
     let ct = cipher
         .encrypt(
@@ -284,17 +303,21 @@ pub fn unwrap_with_identity(
     epk_arr.copy_from_slice(&sealed.0[..32]);
     let ct = &sealed.0[32..];
 
-    // 2. ECDH
+    // 2. ECDH(同样拒低阶 epk)
     let rsk = XSecretKey::from(*identity.secret_bytes());
     let epk = XPublicKey::from(epk_arr);
     let shared = rsk.diffie_hellman(&epk);
+    if !shared.was_contributory() {
+        return Err(CryptoError::DecryptFailed);
+    }
 
-    // 3. nonce — recipient pubkey 由 identity 自身的 pk 派生
+    // 3. KDF + nonce — recipient pubkey 由 identity 自身的 pk 派生
     let rpk = identity.public_key();
+    let aead_key = derive_sealed_key(shared.as_bytes(), &epk_arr, &rpk);
     let nonce_bytes = derive_nonce(&epk_arr, &rpk);
 
     // 4. AEAD decrypt
-    let cipher = XChaCha20Poly1305::new_from_slice(shared.as_bytes())
+    let cipher = XChaCha20Poly1305::new_from_slice(&*aead_key)
         .map_err(|_| CryptoError::DecryptFailed)?;
     let mut plaintext = cipher
         .decrypt(
@@ -331,6 +354,16 @@ pub fn rotate_shared_vault_key(
     remaining_recipient_pubkeys: &[[u8; X25519_PUBLIC_KEY_LEN]],
 ) -> Result<(SymmetricKey, Vec<SealedSharedKey>)> {
     create_shared_vault(remaining_recipient_pubkeys)
+}
+
+/// 把 X25519 裸输出经 BLAKE3::derive_key 转成均匀的 32B AEAD key,并绑定
+/// `epk || rpk` 到本次握手。返回 `Zeroizing` 保证用后擦除。
+fn derive_sealed_key(dh: &[u8; 32], epk: &[u8; 32], rpk: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    let mut material = Zeroizing::new(Vec::with_capacity(96));
+    material.extend_from_slice(dh);
+    material.extend_from_slice(epk);
+    material.extend_from_slice(rpk);
+    Zeroizing::new(blake3::derive_key(SEALED_KDF_CONTEXT, &material))
 }
 
 fn derive_nonce(epk: &[u8; 32], rpk: &[u8; 32]) -> [u8; NONCE_LEN] {
@@ -547,6 +580,16 @@ mod tests {
         let (key, wraps) = create_shared_vault(&[]).unwrap();
         assert_eq!(wraps.len(), 0);
         assert_ne!(key.expose_secret(), &[0u8; SHARED_VAULT_KEY_LEN]);
+    }
+
+    #[test]
+    fn low_order_recipient_pubkey_rejected() {
+        // 全零是 Curve25519 的低阶点:ECDH 输出恒为全零、was_contributory 为假。
+        // 恶意 provider 若把成员公钥换成这种点,wrap 必须直接失败而非产出可预测密文。
+        let key = SymmetricKey::from_bytes([0x42; SHARED_VAULT_KEY_LEN]);
+        let low_order = [0u8; X25519_PUBLIC_KEY_LEN];
+        let r = wrap_for_recipient(key.expose_secret(), &low_order);
+        assert!(matches!(r, Err(CryptoError::EncryptFailed)));
     }
 
     #[test]
