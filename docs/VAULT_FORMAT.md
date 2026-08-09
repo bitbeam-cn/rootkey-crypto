@@ -248,7 +248,7 @@ Phase 1 只在 [`AttachmentRef`] 里占位元数据,实际字节文件 / 加密�
 
 ## 9. 测试覆盖
 
-`crates/vault_core/tests/manager.rs` 共 23 个端到端测试,覆盖:
+产品主仓的 vault 管理层(闭源)另有 23 个端到端测试,覆盖:
 
 - 创建 → 读取 round-trip
 - 更新版本递增 + 历史归档

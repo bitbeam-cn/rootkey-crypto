@@ -77,7 +77,7 @@ Master Password
 | 常数时间比较 | `subtle::ConstantTimeEq` | 校验和判定 |
 | 内存清零 | `zeroize::ZeroizeOnDrop` + `Zeroizing<T>` | 所有密钥与中间缓冲 |
 | 签名(Phase 2) | Ed25519 | vault 文件防篡改 |
-| Sync rev 防回滚 | BLAKE3 over manifest + 单调 rev | sync_core 已实现 |
+| Sync rev 防回滚 | BLAKE3 over manifest + 单调 rev | 产品同步层已实现 |
 
 **KDF 客户端最低值**(写入代码,vault header 即使指定更低也拒绝):
 
@@ -164,13 +164,13 @@ UI 强制主密码 ≥ 12 位 + zxcvbn score ≥ 3,创建流程生成恢复密�
 | **每次写操作桌面弹框确认** | ✅ create/edit/delete 都弹 | ❌ 不弹 |
 | **可操作范围** | 全部条目 | **只限 `ai-readable` 标签**(读/改/删/建都强制) |
 
-- **信任边界**:socket + `cli.token` 均 0600 = **同一用户 + App 已解锁**即视为可信。这跟 App 自身的边界一致——同用户进程本就能读已解锁 App 的内存,`cli.token` 对同用户威胁不提供额外防线(见 `patterns.md`「native socket」)。CLI 能调用是设计内的(对标 1Password `op`),不是漏洞。
+- **信任边界**:socket + `cli.token` 均 0600 = **同一用户 + App 已解锁**即视为可信。这跟 App 自身的边界一致——同用户进程本就能读已解锁 App 的内存,`cli.token` 对同用户威胁不提供额外防线。CLI 能调用是设计内的(对标 1Password `op`),不是漏洞。
 - **CLI 的弹框是额外防线**:针对「机器上某后台进程在我没看见时静默写库」这一担忧。**不要移除 CLI 侧确认**——CLI 不限范围,去掉确认 = 任何同用户进程可在解锁期静默改写整库。
 - **MCP 免确认的前提不是「信任 AI」,而是范围锁**:AI 被死锁在 `ai-readable` 白名单内,blast radius 收窄到用户显式授权的条目;银行 / 主邮箱等未打标签的条目 AI 看不到也动不了。**这个范围锁替代了弹框**,是等价的安全闸,不是弱化。
 - **enforce 点在守护端,不信客户端**:`is_mcp = env.id == "mcp"`;写路径 `if is_mcp && !payload_ai_readable(...) → 拒绝`,读路径 MCP client 侧再按 `ai-readable` 过滤。即使有人伪造 `id:"mcp"` 跳过弹框,也只能在白名单范围内动手——伪造的收益仅是「放弃全范围换免确认」,无净增权限。
 - **AI 不能自我授权**:`ai-readable` 标签只能在 RootKey 界面里手动拨,MCP 无法给条目加/去此标签。
 
-代码位置:`crates/ffi_bridge/src/native_socket.rs`(`process_request` 的 `is_mcp` 分流 + `cli_create/cli_update/cli_delete` 的确认与范围守护)、`crates/cli/src/mcp.rs`(读路径 `ai-readable` 过滤)。详见 [CLI.md](CLI.md) 与 [MCP.md](MCP.md)。
+enforce 代码在产品的 FFI 守护层与 CLI 层(闭源部分),不在本仓范围内;本节列出规则是为了让审计者了解密钥之外的访问控制全貌。
 
 ## 9. 测试与回归保护
 

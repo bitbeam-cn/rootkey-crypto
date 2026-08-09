@@ -132,7 +132,6 @@ assert muk.hex() == "daae46b9501cf909ede5ce3241fa4d0509a9b2e1fb0fc31198f5fdc0a82
 ## 7. 如何运行所有测试
 
 ```bash
-cd crates/crypto_core
 cargo test --release  # 含 derive_muk 固定向量(release 模式快)
 ```
 

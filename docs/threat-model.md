@@ -15,10 +15,10 @@
 │  │ Flutter UI   │ ──── token ──> │ Rust 核心 (Trusted)  │   │
 │  │ (Dart)       │                │  ┌─────────────────┐ │   │
 │  │  - 路由       │                │  │ crypto_core     │ │   │
-│  │  - 状态       │                │  │ vault_core      │ │   │
-│  │  - 不持 key   │ <── handle ─── │  │ sync_core       │ │   │
-│  └──────────────┘                │  │ watchtower_core │ │   │
-│         ↓                        │  │ ffi_bridge      │ │   │
+│  │  - 状态       │                │  │ vault manager   │ │   │
+│  │  - 不持 key   │ <── handle ─── │  │ sync engine     │ │   │
+│  └──────────────┘                │  │ watchtower      │ │   │
+│         ↓                        │  │ FFI bridge      │ │   │
 │   渲染:仅展示                    │  └─────────────────┘ │   │
 │   操作:经 FFI                   │  内存:Zeroize        │   │
 │                                  │  密文:文件系统       │   │
@@ -38,6 +38,8 @@
                 │ 攻击者假设可读 / 可写 / 可篡改 │
                 └──────────────────────────────┘
 ```
+
+Rust 核心中,只有 `crypto_core` 在本仓公开;vault manager / sync engine / watchtower / FFI bridge 属产品闭源层,均只是 `crypto_core` 的调用方,不各自实现密码学。
 
 **Trusted 区(我们必须保护)**:Rust 进程内存、crypto_core 的密钥与中间缓冲、vault 文件落盘前的明文。
 
@@ -101,7 +103,7 @@
 - **N8**:CLI / Browser Extension 调用必须通过 per-session token + origin 校验,不能裸调内核 FFI
 - **N9**:Passkey 流程的 UV(User Verification)flag 必须据实置位,不允许对 RP 谎报
 
-`crypto_core` 测试 / `vault_core` 测试 / `sync_core` 测试 / FFI 集成测试覆盖 N1-N7。N8 由 CLI / 扩展层测试覆盖。N9 由 webauthn_core 测试覆盖。
+N1-N7 由本仓测试与产品主仓的 vault / 同步 / FFI 集成测试覆盖。N8 由 CLI / 扩展层测试覆盖。N9 由 Passkey 层测试覆盖。
 
 ## 6. 已知局限与路线
 
