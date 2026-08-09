@@ -1,0 +1,46 @@
+[package]
+name = "rootkey-crypto"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bitbeam-cn/rootkey-crypto"
+description = "Cryptographic core of RootKey password manager — KDF / AEAD / key hierarchy / signing / sealed sharing. Open for audit."
+keywords = ["cryptography", "password-manager", "argon2", "aead", "zeroize"]
+categories = ["cryptography"]
+
+[lib]
+name = "crypto_core"
+crate-type = ["rlib"]
+
+[dependencies]
+thiserror = "1"
+zeroize = { version = "1.8", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+
+# KDF
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
+
+# AEAD
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "rand_core"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "rand_core"] }
+
+# RNG
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+getrandom = "0.2"
+
+# Signing / key agreement
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core", "zeroize"] }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+
+# Constant-time comparisons (used transitively, pinned for clarity)
+subtle = { version = "2.5", default-features = false }
+
+# Encoding & helpers
+data-encoding = "2.5"
+unicode-normalization = "0.1"
+blake3 = { version = "1.5", default-features = false }
+
+[dev-dependencies]
+serde_json = "1"
+hex = "0.4"
