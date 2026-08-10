@@ -135,10 +135,10 @@ fn derive_muk_fixed_input_locked_hex() {
 #[test]
 fn end_to_end_with_fixed_password() {
     let created = crypto_core::create_vault_keys("p@ssw0rd!").unwrap();
-    let blob = encrypt_item(b"hello world", &created.unlocked).unwrap();
+    let blob = encrypt_item(b"hello world", &[9u8; 16], &created.unlocked).unwrap();
 
     let unlocked = unlock_vault("p@ssw0rd!", &created.encrypted).unwrap();
-    let decrypted = decrypt_item(&blob, &unlocked).unwrap();
+    let decrypted = decrypt_item(&blob, &[9u8; 16], &unlocked).unwrap();
     assert_eq!(decrypted.as_slice(), b"hello world");
 
     assert!(unlock_vault("p@ssw0rd?", &created.encrypted).is_err());

@@ -287,6 +287,48 @@ pub fn rotate_vault_key(
     Ok((next_keyset, next_unlocked, rewrapped_signing_seed))
 }
 
+/// 旋转 IKEK(条目泄露止损)。
+///
+/// 与 [`rotate_vault_key`] 不同:VMK 旋转刻意**不**换 IKEK(item 零重写);而 IKEK
+/// 一旦泄露(它包裹每条 ItemKey),等于全库条目暴露 —— 此时必须换 IKEK,并把
+/// **每条 item 的 wrapped_item_key** 用新 IKEK 重包(ItemKey 值不变、item 密文
+/// 与 payload 完全不动,只换外层包裹)。本函数生成新 IKEK 并用 VMK 重包;逐条
+/// item 的重包由调用方(vault_core)用 [`crate::item::rewrap_item_key`] 编排 O(n)。
+///
+/// 返回新 keyset(替换持久化旧版)+ 持新 IKEK 的 [`UnlockedVault`]。
+pub fn rotate_ikek(
+    unlocked: &UnlockedVault,
+    current: &EncryptedKeySet,
+) -> Result<(EncryptedKeySet, UnlockedVault)> {
+    if current.account_id != unlocked.account_id || current.vault_id != unlocked.vault_id {
+        return Err(CryptoError::InvalidArgument("keyset/vault id mismatch"));
+    }
+    let new_ikek = ItemKekKey::generate()?;
+    let wrapped_ikek = wrap_key(&unlocked.vmk.0, &new_ikek.0, &aad_for_ikek(&current.vault_id))?;
+
+    let next_keyset = EncryptedKeySet {
+        version: current.version,
+        account_id: current.account_id,
+        vault_id: current.vault_id,
+        kdf: current.kdf.clone(),
+        wrapped_kek: current.wrapped_kek.clone(),
+        wrapped_vmk: current.wrapped_vmk.clone(),
+        wrapped_ikek,
+    };
+    let next_unlocked = UnlockedVault {
+        account_id: unlocked.account_id,
+        vault_id: unlocked.vault_id,
+        kek: KeyEncryptionKey::from_symmetric(SymmetricKey::try_from_slice(
+            unlocked.kek.expose_secret(),
+        )?),
+        vmk: VaultMasterKey::from_symmetric(SymmetricKey::try_from_slice(
+            unlocked.vmk.expose_secret(),
+        )?),
+        ikek: new_ikek,
+    };
+    Ok((next_keyset, next_unlocked))
+}
+
 // ---------- 生物识别 ----------
 
 /// 启用生物识别后,本地需要持久化的「信封」。
@@ -430,19 +472,21 @@ pub(crate) fn aad_for_ikek(vault_id: &Id) -> Vec<u8> {
     out
 }
 
-pub(crate) fn aad_for_item_key(vault_id: &Id) -> Vec<u8> {
-    let mut out = Vec::with_capacity(AAD_PREFIX.len() + 32 + 16);
+pub(crate) fn aad_for_item_key(vault_id: &Id, item_id: &[u8; 16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(AAD_PREFIX.len() + 32 + 16 + 16);
     out.extend_from_slice(AAD_PREFIX);
-    out.extend_from_slice(b"/wrap-item-key/v1/");
+    out.extend_from_slice(b"/wrap-item-key/v2/"); // v2:AAD 纳入 item_id
     out.extend_from_slice(vault_id);
+    out.extend_from_slice(item_id);
     out
 }
 
-pub(crate) fn aad_for_item_blob(vault_id: &Id) -> Vec<u8> {
-    let mut out = Vec::with_capacity(AAD_PREFIX.len() + 32 + 16);
+pub(crate) fn aad_for_item_blob(vault_id: &Id, item_id: &[u8; 16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(AAD_PREFIX.len() + 32 + 16 + 16);
     out.extend_from_slice(AAD_PREFIX);
-    out.extend_from_slice(b"/item-blob/v1/");
+    out.extend_from_slice(b"/item-blob/v2/"); // v2:AAD 纳入 item_id
     out.extend_from_slice(vault_id);
+    out.extend_from_slice(item_id);
     out
 }
 

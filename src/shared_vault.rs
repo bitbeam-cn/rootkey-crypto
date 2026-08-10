@@ -108,13 +108,18 @@ impl std::fmt::Debug for SharedIdentityKeyPair {
     }
 }
 
-/// 包给单个 recipient 的 sealed_box 字节(epk 32B + ciphertext 32+16=48B)。
+/// 密封盒格式版本(1 字节前缀)。为后量子 hybrid / 格式演进留门:
+/// 未来上 X25519+ML-KEM 会大幅改变 wire,靠此字节区分老/新格式。
+pub const SEALED_FORMAT_V1: u8 = 1;
+
+/// 包给单个 recipient 的 sealed_box 字节:`version(1B) || libsodium sealed box`。
+/// libsodium 部分 = epk 32B + ciphertext(32 明文 + 16 tag)= 80。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedSharedKey(pub Vec<u8>);
 
 impl SealedSharedKey {
-    /// 期望长度 = 32(epk) + 32(key plaintext) + 16(Poly1305 tag) = 80
-    pub const EXPECTED_LEN: usize = 32 + SHARED_VAULT_KEY_LEN + 16;
+    /// 期望长度 = 1(版本) + 32(epk) + 32(key) + 16(tag) = 81。
+    pub const EXPECTED_LEN: usize = 1 + 32 + SHARED_VAULT_KEY_LEN + 16;
 }
 
 /// 跨 crate 版本(`vault_core` 等下游):返回 `Zeroizing<[u8; 32]>` 而非
@@ -232,7 +237,11 @@ pub fn wrap_for_recipient(
     let recipient_pk = PublicKey::from(*recipient_pubkey);
     let sealed = DryocBox::seal_to_vecbox(shared_vault_key.as_slice(), &recipient_pk)
         .map_err(|_| CryptoError::EncryptFailed)?;
-    Ok(SealedSharedKey(sealed.to_vec()))
+    let body = sealed.to_vec();
+    let mut out = Vec::with_capacity(1 + body.len());
+    out.push(SEALED_FORMAT_V1); // 版本前缀,为格式演进留门
+    out.extend_from_slice(&body);
+    Ok(SealedSharedKey(out))
 }
 
 /// recipient 用自己的 X25519 keypair open sealed box,拿回 shared_vault_key。
@@ -240,8 +249,12 @@ pub fn unwrap_with_identity(
     sealed: &SealedSharedKey,
     identity: &SharedIdentityKeyPair,
 ) -> Result<SymmetricKey> {
+    // 剥版本前缀:目前只认 v1。
+    if sealed.0.first() != Some(&SEALED_FORMAT_V1) {
+        return Err(CryptoError::DecryptFailed);
+    }
     let dbox =
-        DryocBox::from_sealed_bytes(&sealed.0).map_err(|_| CryptoError::DecryptFailed)?;
+        DryocBox::from_sealed_bytes(&sealed.0[1..]).map_err(|_| CryptoError::DecryptFailed)?;
     let keypair = identity.dryoc_keypair();
     let mut plaintext = dbox
         .unseal_to_vec(&keypair)
@@ -479,6 +492,18 @@ mod tests {
     }
 
     #[test]
+    fn wrong_version_prefix_rejected() {
+        let bob = SharedIdentityKeyPair::generate().unwrap();
+        let (_key, wraps) = create_shared_vault(&[bob.public_key()]).unwrap();
+        let mut bad = wraps[0].clone();
+        bad.0[0] = 0xFF; // 非 v1 版本
+        assert!(matches!(
+            unwrap_with_identity(&bad, &bob),
+            Err(CryptoError::DecryptFailed)
+        ));
+    }
+
+    #[test]
     fn low_order_recipient_pubkey_rejected() {
         // 全零是 Curve25519 的低阶点:ECDH 输出恒为全零、was_contributory 为假。
         // 恶意 provider 若把成员公钥换成这种点,wrap 必须直接失败而非产出可预测密文。
@@ -494,6 +519,7 @@ mod tests {
         let key = SymmetricKey::from_bytes([0x33; SHARED_VAULT_KEY_LEN]);
         let w = wrap_for_recipient(key.expose_secret(), &bob.public_key()).unwrap();
         assert_eq!(w.0.len(), SealedSharedKey::EXPECTED_LEN);
-        assert_eq!(SealedSharedKey::EXPECTED_LEN, 80);
+        assert_eq!(SealedSharedKey::EXPECTED_LEN, 81);
+        assert_eq!(w.0[0], SEALED_FORMAT_V1);
     }
 }

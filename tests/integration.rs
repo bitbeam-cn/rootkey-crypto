@@ -18,7 +18,8 @@ fn full_lifecycle_create_persist_unlock_encrypt_decrypt() {
     ];
     let blobs: Vec<_> = plaintexts
         .iter()
-        .map(|p| encrypt_item(p, &created.unlocked).unwrap())
+        .enumerate()
+        .map(|(i, p)| encrypt_item(p, &[i as u8; 16], &created.unlocked).unwrap())
         .collect();
 
     // 3. 持久化(JSON 模拟)
@@ -40,8 +41,8 @@ fn full_lifecycle_create_persist_unlock_encrypt_decrypt() {
     let unlocked = unlock_vault("hunter2-stronger-please", &parsed_keyset).unwrap();
 
     // 6. 解密所有 item,逐字节匹配
-    for (blob, expected) in parsed_blobs.iter().zip(plaintexts.iter()) {
-        let decrypted = decrypt_item(blob, &unlocked).unwrap();
+    for (i, (blob, expected)) in parsed_blobs.iter().zip(plaintexts.iter()).enumerate() {
+        let decrypted = decrypt_item(blob, &[i as u8; 16], &unlocked).unwrap();
         assert_eq!(decrypted.as_slice(), *expected);
     }
 }
@@ -49,7 +50,7 @@ fn full_lifecycle_create_persist_unlock_encrypt_decrypt() {
 #[test]
 fn change_password_then_decrypt_old_items() {
     let created = create_vault_keys("old-pw").unwrap();
-    let blob = encrypt_item(b"important", &created.unlocked).unwrap();
+    let blob = encrypt_item(b"important", &[7u8; 16], &created.unlocked).unwrap();
 
     let new_keyset =
         change_master_password("old-pw", "new-stronger-pw", &created.encrypted).unwrap();
@@ -62,23 +63,23 @@ fn change_password_then_decrypt_old_items() {
 
     // 新密码可以解锁,且历史 item 仍然可解
     let unlocked = unlock_vault("new-stronger-pw", &new_keyset).unwrap();
-    let decrypted = decrypt_item(&blob, &unlocked).unwrap();
+    let decrypted = decrypt_item(&blob, &[7u8; 16], &unlocked).unwrap();
     assert_eq!(decrypted.as_slice(), b"important");
 }
 
 #[test]
 fn rotate_vault_key_keeps_items_decryptable() {
     let created = create_vault_keys("pw").unwrap();
-    let blob = encrypt_item(b"persistent secret", &created.unlocked).unwrap();
+    let blob = encrypt_item(b"persistent secret", &[8u8; 16], &created.unlocked).unwrap();
 
     let (new_keyset, new_unlocked, _) =
         rotate_vault_key(&created.unlocked, &created.encrypted, None).unwrap();
 
-    let decrypted = decrypt_item(&blob, &new_unlocked).unwrap();
+    let decrypted = decrypt_item(&blob, &[8u8; 16], &new_unlocked).unwrap();
     assert_eq!(decrypted.as_slice(), b"persistent secret");
 
     let unlocked_again = unlock_vault("pw", &new_keyset).unwrap();
-    let decrypted_again = decrypt_item(&blob, &unlocked_again).unwrap();
+    let decrypted_again = decrypt_item(&blob, &[8u8; 16], &unlocked_again).unwrap();
     assert_eq!(decrypted_again.as_slice(), b"persistent secret");
 }
 

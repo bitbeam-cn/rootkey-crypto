@@ -38,8 +38,9 @@
 //!
 //! let vault = create_vault_keys("hunter2 — but stronger pls")?;
 //!
-//! let blob = encrypt_item(b"my login data", &vault.unlocked)?;
-//! let plain = decrypt_item(&blob, &vault.unlocked)?;
+//! let item_id = [0x11u8; 16]; // 该 item 的稳定身份(通常是 UUID),进 AAD
+//! let blob = encrypt_item(b"my login data", &item_id, &vault.unlocked)?;
+//! let plain = decrypt_item(&blob, &item_id, &vault.unlocked)?;
 //! assert_eq!(plain.as_slice(), b"my login data");
 //! # Ok::<_, crypto_core::CryptoError>(())
 //! ```
@@ -72,7 +73,7 @@ pub use account::{
 };
 pub use error::{CryptoError, Result};
 pub use export::{open_with_password, seal_with_password, EncryptedBundle, EXPORT_MAGIC};
-pub use item::{decrypt_item, encrypt_item, EncryptedItemBlob};
+pub use item::{decrypt_item, encrypt_item, rewrap_item_key, EncryptedItemBlob, ITEM_FORMAT_VERSION};
 pub use kdf::{
     derive_muk, KdfAlgorithm, KdfParams, DEFAULT_MEMORY_KIB, DEFAULT_PARALLELISM, DEFAULT_TIME_COST,
 };
@@ -84,7 +85,8 @@ pub use shared_vault::{
 pub use share::{open_share, seal_share, ShareBlob, ShareKey};
 pub use signing::{Signature, SigningKey, VerifyingKey};
 pub use vault::{
-    change_master_password, create_vault_keys, enable_biometric_unlock, rotate_vault_key,
+    change_master_password, create_vault_keys, enable_biometric_unlock, rotate_ikek,
+    rotate_vault_key,
     unlock_vault, unlock_via_biometric, unwrap_signing_seed, wrap_signing_seed,
     BiometricEnvelope, BiometricUnlockSetup, EncryptedKeySet, UnlockedVault, VaultKeySet,
     KEYSET_FORMAT_VERSION,
