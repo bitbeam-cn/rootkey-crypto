@@ -1,37 +1,16 @@
-//! ADR-003 共享 vault 加密原语:X25519 sealed_box + per-recipient wrapped key。
+//! ADR-003 共享 vault 加密原语:sealed box + per-recipient wrapped key。
 //!
-//! ## sealed_box 协议(自实现,无 NaCl 依赖)
+//! ## sealed_box 协议(**不自实现**,直接用 `dryoc` 的 libsodium `crypto_box_seal`)
 //!
-//! 给 recipient pubkey `rpk` 发 32B `shared_vault_key`:
+//! 之前这里手搓了 X25519 ECDH + BLAKE3 KDF + XChaCha20 的密封构造。现在改成
+//! 直接调 [`dryoc::dryocbox::DryocBox`] 的 `seal`/`unseal`(= libsodium
+//! `crypto_box_seal`,纯 Rust、与 C libsodium 逐字节兼容、按 libsodium 测试
+//! 向量验证):X25519 密钥派生 + XSalsa20-Poly1305 + 匿名 ephemeral 发送方。
+//! ephemeral keypair、nonce = BLAKE2b(epk‖rpk)、低阶点检查(crypto_scalarmult
+//! 拒全零输出)全部在库内正确实现,不再由本 crate 拼装。
 //!
-//! ```text
-//! 1. (esk, epk) = X25519 ephemeral keypair  (32B sk + 32B pk)
-//! 2. dh        = X25519(esk, rpk)              (32B,须 was_contributory)
-//! 3. key       = BLAKE3::derive_key(kdf_ctx, dh || epk || rpk)  (32B)
-//! 4. nonce     = BLAKE3(domain || epk || rpk)[..24]   (24B)
-//! 5. ct        = XChaCha20-Poly1305(key, nonce, aad=domain, msg=key)
-//! 6. output    = epk(32B) || ct(48B = 32 + 16 tag)
-//! ```
-//!
-//! Open(recipient 用 rsk):
-//!
-//! ```text
-//! 1. epk = output[..32];  ct = output[32..]
-//! 2. dh  = X25519(rsk, epk)                     (须 was_contributory)
-//! 3. key = BLAKE3::derive_key(kdf_ctx, dh || epk || pk_from(rsk))
-//! 4. nonce  = BLAKE3(domain || epk || pk_from(rsk))[..24]
-//! 5. msg    = XChaCha20-Poly1305 decrypt(key, nonce, aad=domain, ct)
-//! ```
-//!
-//! - **KDF(关键)**:ECDH 裸输出**不**直接当 AEAD key —— 过 `BLAKE3::derive_key`
-//!   转成均匀密钥,且绑定 `epk || rpk` 到具体握手;同时两侧都校验
-//!   `was_contributory()` 拒绝低阶点。二者共同挡住"恶意同步 provider 用低阶点
-//!   公钥换掉某成员 → ECDH 输出可预测 → 直接解出 shared_vault_key"这条链路。
-//! - **domain / kdf_ctx**:固定字节串,与其它 sealed 用法隔离;改值需升级 schema 版本
-//! - **AEAD**:XChaCha20-Poly1305(同 vault item 加密)— 已有 dep,符合
-//!   SECURITY_MODEL "不发明算法" 原则
-//! - **nonce 唯一性**:每个 ephemeral keypair fresh 生成 → nonce = H(domain, epk,
-//!   rpk) 几乎不可重复(2^192 抗碰撞)
+//! wire 格式 = `ephemeral_pk(32) || box(mac 16 + ciphertext)`,与 libsodium
+//! 密封盒兼容;对 32B 的 shared_vault_key 恰好 80 字节。
 //!
 //! ## 模型
 //!
@@ -54,10 +33,9 @@
 //! - **N4**:X25519 keypair 用户层标记 "identity",生命周期 ≥ vault 本身
 //! - **N5**:wrap 数组长度 = recipient 数,无硬上限
 
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use dryoc::dryocbox::{DryocBox, KeyPair, PublicKey, SecretKey};
+use dryoc::types::ByteArray;
 use serde::{Deserialize, Serialize};
-use x25519_dalek::{PublicKey as XPublicKey, StaticSecret as XSecretKey};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{CryptoError, Result};
@@ -71,17 +49,10 @@ pub const X25519_SECRET_KEY_LEN: usize = 32;
 /// shared_vault_key 字节长度 = SymmetricKey::LEN(32)。
 pub const SHARED_VAULT_KEY_LEN: usize = SymmetricKey::LEN;
 
-/// sealed_box AAD 域分隔。v2:ECDH 输出改经 BLAKE3 KDF(不再裸用)+ contributory 校验。
-const DOMAIN: &[u8] = b"root-key/shared-vault-key/v2";
-
-/// sealed_box 密钥派生 context —— 把 X25519 裸输出转成均匀 AEAD key。
-const SEALED_KDF_CONTEXT: &str = "root-key/shared-vault-sealed/v2";
-
-/// XChaCha20 nonce 长度。
-const NONCE_LEN: usize = 24;
-
 /// 长期 identity X25519 keypair。每个用户启用 "共享 vault 能力" 时生成一次,
 /// 写本地 + pubkey 通过同步 provider 发布(`identities/<user_id>.json`)。
+/// 密钥派生与密封盒运算全部委托给 [`dryoc`](libsodium crypto_box),本类型只
+/// 持有原始字节 + 提供构造。
 #[derive(Clone)]
 pub struct SharedIdentityKeyPair {
     secret: Zeroizing<[u8; X25519_SECRET_KEY_LEN]>,
@@ -89,24 +60,21 @@ pub struct SharedIdentityKeyPair {
 }
 
 impl SharedIdentityKeyPair {
-    /// 新建一个 keypair。sk 用 OS CSPRNG 取 32B,pubkey 用 X25519 派生。
+    /// 新建一个 keypair。用 dryoc(libsodium crypto_box)生成 X25519 keypair。
     pub fn generate() -> Result<Self> {
-        let raw = random::bytes::<X25519_SECRET_KEY_LEN>()?;
-        let sk = XSecretKey::from(raw);
-        let pk = XPublicKey::from(&sk);
+        let kp = KeyPair::gen();
         Ok(Self {
-            secret: Zeroizing::new(raw),
-            public: pk.to_bytes(),
+            secret: Zeroizing::new(*kp.secret_key.as_array()),
+            public: *kp.public_key.as_array(),
         })
     }
 
-    /// 从已落盘的 sk 字节恢复。pubkey 自动派生。
+    /// 从已落盘的 sk 字节恢复。pubkey 由 dryoc 从 secret 派生(X25519 basepoint mult)。
     pub fn from_secret(secret_bytes: [u8; X25519_SECRET_KEY_LEN]) -> Self {
-        let sk = XSecretKey::from(secret_bytes);
-        let pk = XPublicKey::from(&sk);
+        let kp = KeyPair::from_secret_key(SecretKey::from(secret_bytes));
         Self {
             secret: Zeroizing::new(secret_bytes),
-            public: pk.to_bytes(),
+            public: *kp.public_key.as_array(),
         }
     }
 
@@ -117,6 +85,11 @@ impl SharedIdentityKeyPair {
 
     fn secret_bytes(&self) -> &[u8; X25519_SECRET_KEY_LEN] {
         &self.secret
+    }
+
+    /// 构造 dryoc keypair 供密封盒 unseal 使用(public 由 secret 现场派生)。
+    fn dryoc_keypair(&self) -> KeyPair {
+        KeyPair::from_secret_key(SecretKey::from(*self.secret))
     }
 
     /// crate-private:给 identity.rs 的 wrap_with_vault 用,把 X25519 secret seed
@@ -246,89 +219,49 @@ pub fn create_shared_vault(
     Ok((key, wraps))
 }
 
-/// 用 recipient pubkey 把 shared_vault_key 包装成 sealed_box。
+/// 用 recipient pubkey 把 shared_vault_key 密封成 libsodium sealed box。
+///
+/// 直接调 dryoc 的 `DryocBox::seal`:ephemeral keypair / nonce 派生 / 低阶点
+/// 检查全在库内。输出 = `to_vec()` 的 libsodium 兼容字节。
 pub fn wrap_for_recipient(
     shared_vault_key: &[u8; SHARED_VAULT_KEY_LEN],
     recipient_pubkey: &[u8; X25519_PUBLIC_KEY_LEN],
 ) -> Result<SealedSharedKey> {
-    // 1. ephemeral keypair
-    let esk_bytes = random::bytes::<X25519_SECRET_KEY_LEN>()?;
-    let esk = XSecretKey::from(esk_bytes);
-    let epk = XPublicKey::from(&esk).to_bytes();
-
-    // 2. ECDH shared secret(拒低阶点:was_contributory 为假 = rpk 落在小子群,
-    //    ECDH 输出可预测 → 直接失败,不产出 sealed box)
-    let rpk = XPublicKey::from(*recipient_pubkey);
-    let shared = esk.diffie_hellman(&rpk);
-    if !shared.was_contributory() {
-        return Err(CryptoError::EncryptFailed);
-    }
-
-    // 3. KDF:裸 ECDH 输出 → 均匀 AEAD key(绑定 epk||rpk 到本次握手)
-    let aead_key = derive_sealed_key(shared.as_bytes(), &epk, recipient_pubkey);
-
-    // 4. nonce = BLAKE3(domain || epk || rpk)[..24]
-    let nonce_bytes = derive_nonce(&epk, recipient_pubkey);
-
-    // 5. AEAD encrypt
-    let cipher = XChaCha20Poly1305::new_from_slice(&*aead_key)
+    reject_low_order_pubkey(recipient_pubkey)?;
+    let recipient_pk = PublicKey::from(*recipient_pubkey);
+    let sealed = DryocBox::seal_to_vecbox(shared_vault_key.as_slice(), &recipient_pk)
         .map_err(|_| CryptoError::EncryptFailed)?;
-    let ct = cipher
-        .encrypt(
-            XNonce::from_slice(&nonce_bytes),
-            Payload {
-                msg: shared_vault_key,
-                aad: DOMAIN,
-            },
-        )
-        .map_err(|_| CryptoError::EncryptFailed)?;
-
-    // 5. output = epk || ct
-    let mut out = Vec::with_capacity(32 + ct.len());
-    out.extend_from_slice(&epk);
-    out.extend_from_slice(&ct);
-    Ok(SealedSharedKey(out))
+    Ok(SealedSharedKey(sealed.to_vec()))
 }
 
-/// recipient 用自己的 X25519 sk open sealed,拿回 shared_vault_key。
+/// 拒绝低阶(小子群)X25519 公钥。
+///
+/// dryoc 0.7.2 的 `seal` 路径**不**做 libsodium 的低阶点检查,直接密封会得到一个
+/// 可预测/全零共享密钥的盒子 —— 恶意同步 provider 把某成员公钥换成低阶点即可
+/// 直接解出 shared_vault_key。这里用 dryoc 自己的 `crypto_scalarmult`(内部 clamp
+/// scalar = cofactor 倍)探测:低阶点被映射到 identity → 全零输出 → 拒绝。等价于
+/// libsodium 内部的输出全零检查,非自造算法。
+fn reject_low_order_pubkey(pubkey: &[u8; X25519_PUBLIC_KEY_LEN]) -> Result<()> {
+    use dryoc::classic::crypto_core::crypto_scalarmult;
+    let mut out = [0u8; 32];
+    crypto_scalarmult(&mut out, &[1u8; 32], pubkey);
+    if out.iter().all(|&b| b == 0) {
+        return Err(CryptoError::EncryptFailed);
+    }
+    Ok(())
+}
+
+/// recipient 用自己的 X25519 keypair open sealed box,拿回 shared_vault_key。
 pub fn unwrap_with_identity(
     sealed: &SealedSharedKey,
     identity: &SharedIdentityKeyPair,
 ) -> Result<SymmetricKey> {
-    if sealed.0.len() < SealedSharedKey::EXPECTED_LEN {
-        return Err(CryptoError::DecryptFailed);
-    }
-    // 1. split epk + ct
-    let mut epk_arr = [0u8; X25519_PUBLIC_KEY_LEN];
-    epk_arr.copy_from_slice(&sealed.0[..32]);
-    let ct = &sealed.0[32..];
-
-    // 2. ECDH(同样拒低阶 epk)
-    let rsk = XSecretKey::from(*identity.secret_bytes());
-    let epk = XPublicKey::from(epk_arr);
-    let shared = rsk.diffie_hellman(&epk);
-    if !shared.was_contributory() {
-        return Err(CryptoError::DecryptFailed);
-    }
-
-    // 3. KDF + nonce — recipient pubkey 由 identity 自身的 pk 派生
-    let rpk = identity.public_key();
-    let aead_key = derive_sealed_key(shared.as_bytes(), &epk_arr, &rpk);
-    let nonce_bytes = derive_nonce(&epk_arr, &rpk);
-
-    // 4. AEAD decrypt
-    let cipher = XChaCha20Poly1305::new_from_slice(&*aead_key)
+    let dbox =
+        DryocBox::from_sealed_bytes(&sealed.0).map_err(|_| CryptoError::DecryptFailed)?;
+    let keypair = identity.dryoc_keypair();
+    let mut plaintext = dbox
+        .unseal_to_vec(&keypair)
         .map_err(|_| CryptoError::DecryptFailed)?;
-    let mut plaintext = cipher
-        .decrypt(
-            XNonce::from_slice(&nonce_bytes),
-            Payload {
-                msg: ct,
-                aad: DOMAIN,
-            },
-        )
-        .map_err(|_| CryptoError::DecryptFailed)?;
-
     if plaintext.len() != SHARED_VAULT_KEY_LEN {
         plaintext.zeroize();
         return Err(CryptoError::DecryptFailed);
@@ -354,27 +287,6 @@ pub fn rotate_shared_vault_key(
     remaining_recipient_pubkeys: &[[u8; X25519_PUBLIC_KEY_LEN]],
 ) -> Result<(SymmetricKey, Vec<SealedSharedKey>)> {
     create_shared_vault(remaining_recipient_pubkeys)
-}
-
-/// 把 X25519 裸输出经 BLAKE3::derive_key 转成均匀的 32B AEAD key,并绑定
-/// `epk || rpk` 到本次握手。返回 `Zeroizing` 保证用后擦除。
-fn derive_sealed_key(dh: &[u8; 32], epk: &[u8; 32], rpk: &[u8; 32]) -> Zeroizing<[u8; 32]> {
-    let mut material = Zeroizing::new(Vec::with_capacity(96));
-    material.extend_from_slice(dh);
-    material.extend_from_slice(epk);
-    material.extend_from_slice(rpk);
-    Zeroizing::new(blake3::derive_key(SEALED_KDF_CONTEXT, &material))
-}
-
-fn derive_nonce(epk: &[u8; 32], rpk: &[u8; 32]) -> [u8; NONCE_LEN] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(DOMAIN);
-    hasher.update(epk);
-    hasher.update(rpk);
-    let mut nonce = [0u8; NONCE_LEN];
-    let hash = hasher.finalize();
-    nonce.copy_from_slice(&hash.as_bytes()[..NONCE_LEN]);
-    nonce
 }
 
 // ============================================================================
