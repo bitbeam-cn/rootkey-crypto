@@ -37,11 +37,11 @@ Master Password
   VMK   Vault Master Key  (32B,可旋转)
       │  AES-256-GCM-SIV(AAD = label + vault_id)
       ▼
-  IKEK  Item Key Encryption Key  (32B,旋转 VMK 时只重新包装,本身不变)
-      │  AES-256-GCM-SIV,per item(AAD = label + vault_id)
+  IKEK  Item Key Encryption Key  (32B,旋转 VMK 时只重新包装;泄露止损可专门 rotate_ikek 换钥)
+      │  AES-256-GCM-SIV,per item(AAD = label + vault_id + item_id)
       ▼
  ItemKey 32B,per item
-      │  XChaCha20-Poly1305(AAD = label + vault_id)
+      │  XChaCha20-Poly1305(AAD = label + vault_id + item_id)
       ▼
  Item Plaintext
 ```
@@ -56,13 +56,27 @@ Master Password
 
 恢复密钥本体**只显示一次**、打印进应急套件,系统不存明文;三条路径都只解开 ARK,ARK 以下(KEK/VMK/IKEK/item)不变。改主密码 / 换恢复密钥 / 换生物识别都是 O(1) 重包 ARK 一条,与 vault 数量无关。
 
-引入 ARK + KEK / VMK / IKEK 中间密钥的好处:
+### 2.1 密钥旋转(信封加密:换锁不动数据)
 
-| 操作 | 影响范围 |
-|------|---------|
-| 改主密码 | 只重新包装 KEK,VMK / IKEK / item 全部不动 |
-| 旋转 VMK | 重新包装 IKEK,item 不动(IKEK 本身密钥不变) |
-| Phase 2 旋转 IKEK(待加) | 需重新包装所有 item key,但 ItemKey / item ciphertext 仍可不动 |
+多层"密钥包裹密钥"(信封加密 / key wrapping)的核心好处:**旋转任一层,只需用新密钥
+重新包裹下一层的钥匙,永远不必重新加密真实数据**。每条 item 的真实数据由 per-item 随机
+ItemKey 加密(密文即便很大也不动),ItemKey 被 IKEK 包裹,逐层上包。换上层密钥 = 把下层
+那把 32B 小钥匙搬进新锁,item 密文一个字节都不变。
+
+| 旋转对象 | API | 影响范围 | 成本 | 何时用 |
+|---|---|---|---|---|
+| 主密码 / KDF salt | `change_master_password` / `change_account_password` | 只重包 KEK(单库)或 ARK(账户) | O(1) | 定期换密码 / 疑似密码泄露 |
+| ARK(账户根密钥) | `rotate_account_root_key` | 重包账户下每个 vault 的 KEK;KEK 以下不动 | O(vault 数) | ARK 疑似泄露(改密码救不回时) |
+| VMK | `rotate_vault_key` | 重包 IKEK + 原子重包 signing seed;**IKEK 值不变、item 零重写** | O(1) | 常规轮换 |
+| **IKEK** | `rotate_ikek` + 逐条 `rewrap_item_key`(vault 层 `rekey_items` 编排) | 重包**每条 item 的 wrapped_item_key**;ItemKey 值与 item 密文/payload 完全不动 | O(条目数) | **IKEK 疑似泄露 = 全库条目暴露的止损** |
+| 共享库密钥 | `rotate_shared_vault_key` | 重新分发给剩余成员(软撤销:只保护未来条目) | O(成员数) | 踢人 / 疑似共享密钥泄露 |
+| 恢复密钥 / 生物识别 | 重调 `setup_recovery_key` / `enable_*_biometric` | 只重包 ARK 一条(旁路包装) | O(1) | 换应急套件 / 重新登记指纹 |
+
+**IKEK 旋转是这里唯一 O(条目数) 的**——因为 IKEK 直接包裹每条 ItemKey——但它也只重包那把
+小钥匙,不重新加密真实数据(几千条也很快)。VMK 旋转刻意**不**换 IKEK(item 零重写),故
+IKEK 需要 `rotate_ikek` 这条独立止损路径:IKEK 一旦泄露等于全库条目暴露,换 IKEK 让泄露副本
+作废。`rekey_items` 编排时逐条读取走带签名校验的路径,**重包前先验旧签名**,避免把被篡改
+文件洗白重签。
 
 ## 3. 算法选型与默认参数
 
@@ -98,10 +112,21 @@ Master Password
 | Wrapped KEK | `"root-key" + "/wrap-kek/v1/" + account_id + vault_id + kdf_params_canonical` |
 | Wrapped VMK | `"root-key" + "/wrap-vmk/v1/" + account_id + vault_id` |
 | Wrapped IKEK | `"root-key" + "/wrap-ikek/v1/" + vault_id` |
-| Wrapped Item Key | `"root-key" + "/wrap-item-key/v1/" + vault_id` |
-| Item Blob | `"root-key" + "/item-blob/v1/" + vault_id` |
+| Wrapped Item Key | `"root-key" + "/wrap-item-key/v2/" + vault_id + item_id` |
+| Item Blob | `"root-key" + "/item-blob/v2/" + vault_id + item_id` |
 
 KDF 参数序列化(`KdfParams::aad_bytes`):算法标识(1B) || memory_kib(BE u32) || time_cost(BE u32) || parallelism(BE u32) || salt(32B)。
+
+**item AAD 绑 item_id(v2)**:每条 item 的 16 字节稳定身份(UUID)进 AAD,把密文与身份
+绑死。解密时 item_id 必须由**可信来源**(item 的存储位置 / manifest 索引)提供 —— 同步层
+攻击者把一条 item 的密文换位 / 回滚 / 复制到同库另一条,AAD 不匹配即解密失败,单条完整性
+锚进密码学本身,不再全赖外层签名。manifest 这类非 item 用保留 sentinel(全零,非合法 UUID)。
+
+**格式版本轴**(变更对应轴时才升,互不连累):
+- `KEYSET_FORMAT_VERSION` / `ACCOUNT_FORMAT_VERSION`:密钥集/账户格式(含包裹 AEAD 算法)。
+- `ITEM_FORMAT_VERSION`:item 封装格式(v3 = AAD 纳入 item_id)。
+- 共享密封盒:`SealedSharedKey` 前置 1 字节版本前缀(`SEALED_FORMAT_V1`),为后量子 hybrid /
+  格式演进留门。
 
 ## 5. 忘记主密码 = 凭恢复密钥重设(主密码与恢复密钥同时丢失才丢数据)
 
