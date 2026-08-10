@@ -35,7 +35,8 @@ getrandom = "0.2"
 ed25519-dalek = { version = "3", default-features = false, features = ["zeroize"] }
 
 # 共享 vault sealed box —— 直接用 dryoc 的 libsodium crypto_box_seal,不自实现。
-# 纯 Rust、与 C libsodium 兼容、按 libsodium 向量验证;内部用 curve25519-dalek 4。
+# 纯 Rust、与 C libsodium 兼容、按 libsodium 向量验证;内部用 curve25519-dalek 4.x
+# (签名走 ed25519-dalek 3 = curve25519-dalek 5,树内共存两个 dalek 主版本)。
 # 1.0 的 seal 会拒绝低阶点公钥,无需再手动 guard。
 dryoc = "1.0"
 
