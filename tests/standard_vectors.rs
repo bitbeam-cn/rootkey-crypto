@@ -3,13 +3,13 @@
 //! 这些向量定义了底层加密原语的"对外契约":
 //! - **RFC 9106 Appendix A.1** —— Argon2id v1.3 测试向量
 //! - **draft-irtf-cfrg-xchacha-03 Appendix A.3.1** —— XChaCha20-Poly1305 测试向量
-//! - **NIST SP 800-38D Test Case 14** —— AES-256-GCM(我们用来 wrap 下层密钥)
+//! - **RFC 8452 Appendix C.2** —— AES-256-GCM-SIV(我们用来 wrap 下层密钥)
 //!
 //! 一旦其中任一向量失败,要么底层 crate 升级改了行为(必须升级 vault 格式版本号),
 //! 要么我们的算法配置(version / block size / KDF 参数)被错误改动。
 
-use aes_gcm::aead::Aead;
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use aes_gcm_siv::aead::Aead;
+use aes_gcm_siv::{Aes256GcmSiv, KeyInit, Nonce};
 use argon2::{Algorithm, Argon2, AssociatedData, KeyId, Params, ParamsBuilder, Version};
 use chacha20poly1305::aead::Payload;
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
@@ -149,38 +149,61 @@ fn xchacha20poly1305_irtf_a31_test_vector() {
 }
 
 // ---------------------------------------------------------------------------
-// NIST SP 800-38D — AES-256-GCM Test Case 14.
+// RFC 8452 Appendix C.2 — AEAD_AES_256_GCM_SIV 官方测试向量。
 //
-// 我们用 AES-256-GCM 包装下层对称密钥(wrap_key / unwrap_key)。
-// Test Case 14(All-zero key + All-zero plaintext):
-//   Key:       32 bytes of 0
-//   IV:        12 bytes of 0
-//   Plaintext: 16 bytes of 0
-//   AAD:       (empty)
-//   Tag:       d0d1c8a799996bf0265b98b5d48ab919
-//   Ciphertext: cea7403d4d606b6e074ec5d3baf39d18
+// 我们用 AES-256-GCM-SIV 包装下层对称密钥(wrap_key / unwrap_key)。
+// C.2 第二组向量(8 字节明文,空 AAD):
+//   Key:        01 followed by 31 zero bytes(32 bytes)
+//   Nonce:      03 followed by 11 zero bytes(12 bytes)
+//   Plaintext:  0100000000000000(8 bytes)
+//   AAD:        (empty)
+//   Result:     c2ef328e5c71c83b843122130f7364b761e0b97427e3df28
+//               (24 bytes = 8 密文 + 16 tag)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn aes256_gcm_nist_test_case_14() {
-    let key = [0u8; 32];
-    let iv = [0u8; 12];
-    let plaintext = [0u8; 16];
+fn aes256_gcm_siv_rfc8452_c2_test_vector() {
+    let key: [u8; 32] = {
+        let mut k = [0u8; 32];
+        k[0] = 0x01;
+        k
+    };
+    let nonce_bytes: [u8; 12] = {
+        let mut n = [0u8; 12];
+        n[0] = 0x03;
+        n
+    };
+    let plaintext: [u8; 8] = [0x01, 0, 0, 0, 0, 0, 0, 0];
 
-    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
-    let nonce = Nonce::from_slice(&iv);
+    let cipher = Aes256GcmSiv::new_from_slice(&key).unwrap();
+    let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let ct = cipher.encrypt(nonce, plaintext.as_ref()).unwrap();
-    // ct = ciphertext (16) || tag (16)
-    let ct_hex = hex::encode(&ct);
+    let ct = cipher
+        .encrypt(
+            nonce,
+            Payload {
+                msg: &plaintext,
+                aad: &[],
+            },
+        )
+        .unwrap();
     assert_eq!(
-        ct_hex,
-        "cea7403d4d606b6e074ec5d3baf39d18d0d1c8a799996bf0265b98b5d48ab919",
-        "NIST SP 800-38D AES-256-GCM Test Case 14 失败"
+        hex::encode(&ct),
+        "c2ef328e5c71c83b843122130f7364b761e0b97427e3df28",
+        "RFC 8452 Appendix C.2 AES-256-GCM-SIV 向量失败 — \
+         底层 aes-gcm-siv crate 行为已变更,需排查"
     );
 
-    // 反向必须能解出全零明文。
-    let recovered = cipher.decrypt(nonce, ct.as_ref()).unwrap();
+    // 反向必须能解出原明文。
+    let recovered = cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: &ct,
+                aad: &[],
+            },
+        )
+        .unwrap();
     assert_eq!(recovered, plaintext);
 }
 

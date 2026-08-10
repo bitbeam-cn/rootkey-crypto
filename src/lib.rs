@@ -12,16 +12,16 @@
 //!         │  Argon2id(P=password, S=salt 32B, memory 128 MiB)
 //!         ▼
 //!     MUK  (Master Unlock Key)
-//!         │  AES-256-GCM
+//!         │  AES-256-GCM-SIV
 //!         ▼
 //!     KEK  (Key Encryption Key)
-//!         │  AES-256-GCM
+//!         │  AES-256-GCM-SIV
 //!         ▼
 //!     VMK  (Vault Master Key)
-//!         │  AES-256-GCM
+//!         │  AES-256-GCM-SIV
 //!         ▼
 //!     IKEK (Item KEK)
-//!         │  AES-256-GCM(per item)
+//!         │  AES-256-GCM-SIV(per item)
 //!         ▼
 //!  ItemKey (per item)
 //!         │  XChaCha20-Poly1305

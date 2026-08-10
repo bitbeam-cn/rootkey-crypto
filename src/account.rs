@@ -37,7 +37,8 @@ use crate::random;
 use crate::vault::{aad_for_ikek, aad_for_vmk, id_bytes, Id, UnlockedVault};
 
 /// 当前 AccountKeySet / VaultKeySlot 的格式版本。
-pub const ACCOUNT_FORMAT_VERSION: u16 = 1;
+/// v2:密钥包裹 AEAD 从 AES-256-GCM 升级为 AES-256-GCM-SIV(RFC 8452)。
+pub const ACCOUNT_FORMAT_VERSION: u16 = 2;
 
 /// 账户持久化部分。**只**包含密文与公开参数,可放心写盘 / 进 keyset bundle 同步。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

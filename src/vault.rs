@@ -14,7 +14,8 @@ use crate::random;
 // SK 已移除(ADR-001):MUK = Argon2id(password, salt),无第二因子。
 
 /// 当前 EncryptedKeySet 的格式版本。
-pub const KEYSET_FORMAT_VERSION: u16 = 1;
+/// v2:密钥包裹 AEAD 从 AES-256-GCM 升级为 AES-256-GCM-SIV(RFC 8452)。
+pub const KEYSET_FORMAT_VERSION: u16 = 2;
 
 /// 16 字节随机 ID(account / vault)。
 pub type Id = [u8; 16];

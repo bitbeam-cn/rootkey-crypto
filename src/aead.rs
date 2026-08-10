@@ -1,15 +1,18 @@
 //! AEAD 封装。
 //!
-//! - **AES-256-GCM**(12B nonce):用于包装下层密钥。密钥短(32B),需要 AAD 绑定上下文,
-//!   nonce 短一点以省 vault 体积。
+//! - **AES-256-GCM-SIV**(RFC 8452,12B nonce):用于包装下层密钥。密钥短(32B),
+//!   需要 AAD 绑定上下文。选 GCM-**SIV** 而非裸 GCM 的原因:包裹密钥(KEK/VMK/IKEK
+//!   等)长命且无轮换出口,GCM-SIV 是 nonce-misuse-resistant —— 即便 RNG 偶发重复
+//!   nonce,也只泄露"两条明文是否相等",不像 GCM 那样一次 nonce 复用即可恢复认证
+//!   密钥、XOR 出明文。这是长命包裹密钥的最佳实践(Tink 等同款选型)。
 //! - **XChaCha20-Poly1305**(24B nonce):用于加密 item payload。payload 可能任意长,
 //!   24B nonce 取自随机数后碰撞概率可忽略,适合大量并发加密。
 //!
 //! **nonce 永不复用**:每次加密都从 OS RNG 取新 nonce。本模块的 `*_seal` 函数自动生成
 //! nonce 并嵌入返回结构,调用方**禁止**手动指定 nonce(API 层面就没暴露)。
 
-use aes_gcm::aead::Aead;
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use aes_gcm_siv::aead::Aead;
+use aes_gcm_siv::{Aes256GcmSiv, KeyInit, Nonce};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -18,18 +21,18 @@ use crate::error::{CryptoError, Result};
 use crate::keys::SymmetricKey;
 use crate::random;
 
-/// AES-256-GCM nonce 长度。
+/// AES-256-GCM-SIV nonce 长度(RFC 8452,12B)。
 pub const AES_GCM_NONCE_LEN: usize = 12;
 /// XChaCha20-Poly1305 nonce 长度。
 pub const XCHACHA_NONCE_LEN: usize = 24;
 
-/// 一段被 AES-256-GCM 包装的对称密钥。
+/// 一段被 AES-256-GCM-SIV 包装的对称密钥。
 ///
-/// 序列化为 `{nonce: bytes, ciphertext: bytes}`,密文里包含 16B Poly1305 tag。
+/// 序列化为 `{nonce: bytes, ciphertext: bytes}`,密文里包含 16B 认证 tag(POLYVAL)。
 /// `ciphertext` 长度恒为 32(明文密钥) + 16(tag) = 48 字节。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WrappedKey {
-    /// AES-GCM 12 字节 nonce。
+    /// AES-GCM-SIV 12 字节 nonce。
     #[serde(with = "nonce_12_bytes")]
     pub nonce: [u8; AES_GCM_NONCE_LEN],
     /// 32 + 16 字节密文。
@@ -53,13 +56,13 @@ pub(crate) fn wrap_key(
     aad: &[u8],
 ) -> Result<WrappedKey> {
     let cipher =
-        Aes256Gcm::new_from_slice(kek.expose_secret()).map_err(|_| CryptoError::EncryptFailed)?;
+        Aes256GcmSiv::new_from_slice(kek.expose_secret()).map_err(|_| CryptoError::EncryptFailed)?;
     let nonce_bytes = random::bytes::<AES_GCM_NONCE_LEN>()?;
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
         .encrypt(
             nonce,
-            aes_gcm::aead::Payload {
+            aes_gcm_siv::aead::Payload {
                 msg: plaintext_key.expose_secret(),
                 aad,
             },
@@ -78,13 +81,13 @@ pub(crate) fn unwrap_key(
     aad: &[u8],
 ) -> Result<SymmetricKey> {
     let cipher =
-        Aes256Gcm::new_from_slice(kek.expose_secret()).map_err(|_| CryptoError::DecryptFailed)?;
+        Aes256GcmSiv::new_from_slice(kek.expose_secret()).map_err(|_| CryptoError::DecryptFailed)?;
     let nonce = Nonce::from_slice(&wrapped.nonce);
     let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(
         cipher
             .decrypt(
                 nonce,
-                aes_gcm::aead::Payload {
+                aes_gcm_siv::aead::Payload {
                     msg: &wrapped.ciphertext,
                     aad,
                 },

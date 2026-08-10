@@ -1,7 +1,7 @@
 //! Item 加密 / 解密。
 //!
 //! 每条 item 的加密分两步:
-//! 1. 生成一把全新随机 [`ItemKey`],用 IKEK 通过 AES-256-GCM 包装
+//! 1. 生成一把全新随机 [`ItemKey`],用 IKEK 通过 AES-256-GCM-SIV 包装
 //! 2. 用 ItemKey 通过 XChaCha20-Poly1305 加密 payload
 //!
 //! 持久化时,wrapped_item_key 与 ciphertext 一起存。解密时反向执行:用 IKEK 解出

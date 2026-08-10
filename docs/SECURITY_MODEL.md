@@ -26,19 +26,19 @@ Master Password
       │  NFKD 归一化 → Argon2id(salt 32B,m=128 MiB / t=3 / p=4 默认)
       ▼
   MUK   Master Unlock Key  (32B,账户级,全账户一份 salt)
-      │  AES-256-GCM(AAD = root-key/wrap-ark/v1 + account_id + kdf_params)
+      │  AES-256-GCM-SIV(AAD = root-key/wrap-ark/v1 + account_id + kdf_params)
       ▼
   ARK   Account Root Key  (32B,账户根密钥,ADR-010)
-      │  AES-256-GCM(AAD = root-key/wrap-vault-kek/v1 + account_id + vault_id)
+      │  AES-256-GCM-SIV(AAD = root-key/wrap-vault-kek/v1 + account_id + vault_id)
       ▼   ├─ 账户下每个逻辑 vault 一条:ARK 包装该 vault 的 KEK
   KEK   Key Encryption Key  (32B,per vault)
-      │  AES-256-GCM(AAD = label + account_id + vault_id)
+      │  AES-256-GCM-SIV(AAD = label + account_id + vault_id)
       ▼
   VMK   Vault Master Key  (32B,可旋转)
-      │  AES-256-GCM(AAD = label + vault_id)
+      │  AES-256-GCM-SIV(AAD = label + vault_id)
       ▼
   IKEK  Item Key Encryption Key  (32B,旋转 VMK 时只重新包装,本身不变)
-      │  AES-256-GCM,per item(AAD = label + vault_id)
+      │  AES-256-GCM-SIV,per item(AAD = label + vault_id)
       ▼
  ItemKey 32B,per item
       │  XChaCha20-Poly1305(AAD = label + vault_id)
@@ -70,7 +70,7 @@ Master Password
 |------|------|------|
 | KDF | Argon2id(RFC 9106) | **m=128 MiB,t=3,p=4**,output=32B,salt=32B 随机 |
 | 主密码归一化 | UTF-8 NFKD | 防止视觉等价 codepoint 派生不同 MUK |
-| 包装 AEAD | AES-256-GCM | nonce=12B 随机 |
+| 包装 AEAD | AES-256-GCM-SIV(RFC 8452) | nonce=12B 随机;nonce-misuse-resistant,包裹密钥长命无轮换即便 nonce 偶发复用也只泄露"明文是否相等" |
 | Item AEAD | XChaCha20-Poly1305 | nonce=24B 随机,碰撞概率可忽略 |
 | 随机数 | OS CSPRNG via `getrandom` | 任何失败立即返回 `RngFailed` |
 | 哈希 | BLAKE3 | 通用摘要 |

@@ -22,7 +22,9 @@ serde = { version = "1", features = ["derive"] }
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
 
 # AEAD
-aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "rand_core"] }
+# 密钥包裹用 AES-256-GCM-SIV(RFC 8452):nonce-misuse-resistant,适合长命包裹密钥。
+# 条目数据仍用 XChaCha20-Poly1305(24B 随机 nonce)。
+aes-gcm-siv = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "rand_core"] }
 
 # RNG

@@ -47,7 +47,7 @@ Master Password(用户记忆,UI 强制 ≥ 12 位 + zxcvbn ≥ 3)
 | 用途 | 选型 | 参数 |
 |---|---|---|
 | 口令派生 | Argon2id | m=128 MiB(OWASP 2024 最低档 19 MiB 的 6.7 倍),t=3,p=4,salt 32B |
-| 密钥包裹 | AES-256-GCM | 随机 96-bit nonce,AAD 绑定层级与格式版本 |
+| 密钥包裹 | AES-256-GCM-SIV(RFC 8452) | 随机 96-bit nonce,AAD 绑定层级与格式版本;nonce-misuse-resistant,适合长命包裹密钥 |
 | 条目加密 | XChaCha20-Poly1305 | 随机 192-bit nonce |
 | 文件签名 | Ed25519 | vault manifest 防篡改/回滚 |
 | 共享密封 | X25519 ECDH → BLAKE3 KDF → XChaCha20-Poly1305 | ECDH 输出经 BLAKE3::derive_key 派生密钥(非裸用)+ 校验 was_contributory 拒低阶点;nonce = BLAKE3(epk ‖ rcpt_pk)[..24] |
