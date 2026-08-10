@@ -24,7 +24,6 @@ use ed25519_dalek::{
     Signature as DalekSignature, SignatureError, Signer, SigningKey as DalekSigningKey,
     VerifyingKey as DalekVerifyingKey,
 };
-use rand_core::{CryptoRng, RngCore};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use zeroize::{ZeroizeOnDrop, Zeroizing};
 
@@ -38,11 +37,6 @@ use crate::error::{CryptoError, Result};
 pub struct SigningKey(DalekSigningKey);
 
 impl SigningKey {
-    /// 用提供的 CSPRNG 生成新 keypair。
-    pub fn generate<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
-        Self(DalekSigningKey::generate(rng))
-    }
-
     /// 从 OS RNG(`crypto_core::random`)生成。**生产代码默认走这条**。
     pub fn generate_os() -> Result<Self> {
         let bytes = crate::random::bytes::<32>()?;
