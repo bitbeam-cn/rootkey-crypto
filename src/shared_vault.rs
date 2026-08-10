@@ -227,28 +227,12 @@ pub fn wrap_for_recipient(
     shared_vault_key: &[u8; SHARED_VAULT_KEY_LEN],
     recipient_pubkey: &[u8; X25519_PUBLIC_KEY_LEN],
 ) -> Result<SealedSharedKey> {
-    reject_low_order_pubkey(recipient_pubkey)?;
+    // dryoc 1.0 的 seal 会拒绝低阶点公钥(crypto_box_detached 返回错误),
+    // 无需再手动 guard —— 交给库处理。
     let recipient_pk = PublicKey::from(*recipient_pubkey);
     let sealed = DryocBox::seal_to_vecbox(shared_vault_key.as_slice(), &recipient_pk)
         .map_err(|_| CryptoError::EncryptFailed)?;
     Ok(SealedSharedKey(sealed.to_vec()))
-}
-
-/// 拒绝低阶(小子群)X25519 公钥。
-///
-/// dryoc 0.7.2 的 `seal` 路径**不**做 libsodium 的低阶点检查,直接密封会得到一个
-/// 可预测/全零共享密钥的盒子 —— 恶意同步 provider 把某成员公钥换成低阶点即可
-/// 直接解出 shared_vault_key。这里用 dryoc 自己的 `crypto_scalarmult`(内部 clamp
-/// scalar = cofactor 倍)探测:低阶点被映射到 identity → 全零输出 → 拒绝。等价于
-/// libsodium 内部的输出全零检查,非自造算法。
-fn reject_low_order_pubkey(pubkey: &[u8; X25519_PUBLIC_KEY_LEN]) -> Result<()> {
-    use dryoc::classic::crypto_core::crypto_scalarmult;
-    let mut out = [0u8; 32];
-    crypto_scalarmult(&mut out, &[1u8; 32], pubkey);
-    if out.iter().all(|&b| b == 0) {
-        return Err(CryptoError::EncryptFailed);
-    }
-    Ok(())
 }
 
 /// recipient 用自己的 X25519 keypair open sealed box,拿回 shared_vault_key。

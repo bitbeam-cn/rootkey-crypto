@@ -50,7 +50,7 @@ Master Password(用户记忆,UI 强制 ≥ 12 位 + zxcvbn ≥ 3)
 | 密钥包裹 | AES-256-GCM-SIV(RFC 8452) | 随机 96-bit nonce,AAD 绑定层级与格式版本;nonce-misuse-resistant,适合长命包裹密钥 |
 | 条目加密 | XChaCha20-Poly1305 | 随机 192-bit nonce |
 | 文件签名 | Ed25519 | vault manifest 防篡改/回滚 |
-| 共享密封 | libsodium `crypto_box_seal`(经 dryoc,纯 Rust) | X25519 + XSalsa20-Poly1305 匿名密封盒;不自实现,直接用审计过的 libsodium 构造 + 额外拒低阶点公钥 |
+| 共享密封 | libsodium `crypto_box_seal`(经 dryoc 1.0,纯 Rust) | X25519 + XSalsa20-Poly1305 匿名密封盒;不自实现,直接用审计过的 libsodium 构造(含低阶点公钥拒绝) |
 | 口令预处理 | NFKD 归一化 | 跨平台输入一致性 |
 
 完整规约见 [`docs/SECURITY_MODEL.md`](docs/SECURITY_MODEL.md)(红线、AAD 模板、错误处理、回归保护)。

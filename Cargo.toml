@@ -2,7 +2,8 @@
 name = "rootkey-crypto"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+# MSRV 1.89:dryoc 1.0 要求(其 sealed box 的 seal 路径会拒绝低阶点公钥)。
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/bitbeam-cn/rootkey-crypto"
 description = "Cryptographic core of RootKey password manager — KDF / AEAD / key hierarchy / signing / sealed sharing. Open for audit."
@@ -36,7 +37,8 @@ ed25519-dalek = { version = "2", default-features = false, features = ["std", "r
 
 # 共享 vault sealed box —— 直接用 dryoc 的 libsodium crypto_box_seal,不自实现。
 # 纯 Rust、与 C libsodium 兼容、按 libsodium 向量验证;内部用 curve25519-dalek 4。
-dryoc = "0.7.2"
+# 1.0 的 seal 会拒绝低阶点公钥,无需再手动 guard。
+dryoc = "1.0"
 
 # Constant-time comparisons (used transitively, pinned for clarity)
 subtle = { version = "2.5", default-features = false }
