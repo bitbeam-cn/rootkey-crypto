@@ -23,16 +23,16 @@ Master Password(用户记忆,UI 强制 ≥ 12 位 + zxcvbn ≥ 3)
         │  Argon2id(salt 32B, m=128 MiB, t=3, p=4)
         ▼
     MUK  (Master Unlock Key)
-        │  AES-256-GCM
+        │  AES-256-GCM-SIV
         ▼
     KEK  (Key Encryption Key)          ← 账户模型下由 ARK(账户根密钥)包裹
-        │  AES-256-GCM
+        │  AES-256-GCM-SIV
         ▼
     VMK  (Vault Master Key)
-        │  AES-256-GCM
+        │  AES-256-GCM-SIV
         ▼
     IKEK (Item KEK)
-        │  AES-256-GCM(per item)
+        │  AES-256-GCM-SIV(per item)
         ▼
  ItemKey (per item)
         │  XChaCha20-Poly1305
@@ -55,6 +55,19 @@ Master Password(用户记忆,UI 强制 ≥ 12 位 + zxcvbn ≥ 3)
 
 完整规约见 [`docs/SECURITY_MODEL.md`](docs/SECURITY_MODEL.md)(红线、AAD 模板、错误处理、回归保护)。
 
+## 为什么没有 1Password 那样的 Secret Key
+
+1Password 的 Secret Key 是第二因子:密文托管在服务商那里,万一服务端数据库泄露,
+攻击者拿到密文也因为缺 Secret Key 而无法离线爆破。它解决的是**「密文在别人手里」**的问题。
+
+RootKey 不托管密文 —— 数据只在你的设备和你自己指定的同步位置。所以我们做了另一个取舍(ADR-001):
+**单因子主密码 + 高成本 KDF**(Argon2id m=128 MiB / t=3 / p=4)+ **主密码门槛**(≥ 12 位且 zxcvbn ≥ 3)。
+
+代价要说清楚:如果你把同步位置(WebDAV / 网盘)里的密文**和一个弱主密码同时**交了出去,
+理论上可被离线爆破。Secret Key 挡的就是这一步;我们靠 KDF 成本和密码强度门槛挡。
+两者不是等价的 —— 前者是数学上的不可分辨,后者是把成本抬到不划算。我们认为对
+「密文不离开自己掌控」的模型,这个取舍成立;如果将来加入第二因子,会作为可选项,不替换主密码。
+
 ## 不读代码也能验证
 
 [`docs/crypto-vectors.md`](docs/crypto-vectors.md) 提供了固定输入的测试向量 ——
@@ -62,8 +75,21 @@ Master Password(用户记忆,UI 强制 ≥ 12 位 + zxcvbn ≥ 3)
 派生流程没有私货。这些向量同时被本仓测试(`tests/`)锁定,CI 里任何偏离都会红。
 
 ```bash
-cargo test          # 165 个测试,含 KAT 向量与跨语言契约
+cargo test          # 168 个测试,含 KAT 向量与跨语言契约
 ```
+
+### 验证「与产品逐字节同源」
+
+产品每次发版都会公布该版本 `crypto_core/src` 的源码树哈希(下载页与发布说明里),
+本仓对应版本打同名 tag。你可以自己算一遍对比:
+
+```bash
+git checkout v0.4.0
+find src -type f | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 256
+```
+
+> 目前验证的是**源码**同源。二进制级的可复现构建(从本仓编出与发行版逐字节相同的产物)
+> 还在路线图上 —— Flutter + Rust FFI 的全链路确定性构建尚未完成,我们不假装已经做到。
 
 ## 文档
 
