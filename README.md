@@ -85,8 +85,10 @@ cargo test          # 168 个测试,含 KAT 向量与跨语言契约
 
 ```bash
 git checkout v0.4.0
-find src -type f | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 256
+find src -type f ! -name '.*' | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 256
 ```
+
+(`! -name '.*'` 排除 `.DS_Store` 之类点文件 —— 它们不是源码,却会让两台机器算出不同的值。)
 
 > 目前验证的是**源码**同源。二进制级的可复现构建(从本仓编出与发行版逐字节相同的产物)
 > 还在路线图上 —— Flutter + Rust FFI 的全链路确定性构建尚未完成,我们不假装已经做到。
