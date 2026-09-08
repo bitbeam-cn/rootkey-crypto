@@ -40,6 +40,10 @@ use crate::vault::{aad_for_ikek, aad_for_vmk, id_bytes, Id, UnlockedVault};
 /// v2:密钥包裹 AEAD 从 AES-256-GCM 升级为 AES-256-GCM-SIV(RFC 8452)。
 pub const ACCOUNT_FORMAT_VERSION: u16 = 2;
 
+/// 能读到多老的账户格式。**提高它之前必须先写好迁移**,否则区间内的老数据会解不开。
+/// 与 [`ACCOUNT_FORMAT_VERSION`] 相等时,行为等价于原来的严格相等检查。
+pub const ACCOUNT_MIN_READABLE_VERSION: u16 = 2;
+
 /// 账户持久化部分。**只**包含密文与公开参数,可放心写盘 / 进 keyset bundle 同步。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AccountKeySet {
@@ -194,8 +198,11 @@ pub fn create_account(master_password: &str) -> Result<AccountKeys> {
 ///
 /// 错误密码 / 篡改一律 [`CryptoError::DecryptFailed`],不区分原因。
 pub fn unlock_account(master_password: &str, keyset: &AccountKeySet) -> Result<UnlockedAccount> {
-    if keyset.version != ACCOUNT_FORMAT_VERSION {
+    if keyset.version > ACCOUNT_FORMAT_VERSION {
         return Err(CryptoError::UnsupportedVersion(keyset.version));
+    }
+    if keyset.version < ACCOUNT_MIN_READABLE_VERSION {
+        return Err(CryptoError::SchemaTooOld(keyset.version));
     }
     keyset.kdf.validate()?;
     let muk = derive_muk(master_password, &keyset.kdf)?;
@@ -216,8 +223,11 @@ pub fn unlock_account_vault(
     entry: &AccountVaultEntry,
     slot: &VaultKeySlot,
 ) -> Result<UnlockedVault> {
-    if slot.version != ACCOUNT_FORMAT_VERSION {
+    if slot.version > ACCOUNT_FORMAT_VERSION {
         return Err(CryptoError::UnsupportedVersion(slot.version));
+    }
+    if slot.version < ACCOUNT_MIN_READABLE_VERSION {
+        return Err(CryptoError::SchemaTooOld(slot.version));
     }
     if slot.account_id != account.account_id || slot.vault_id != entry.vault_id {
         return Err(CryptoError::DecryptFailed);
@@ -442,8 +452,11 @@ pub fn unlock_account_with_recovery_key(
     recovery_key: &str,
     keyset: &AccountKeySet,
 ) -> Result<UnlockedAccount> {
-    if keyset.version != ACCOUNT_FORMAT_VERSION {
+    if keyset.version > ACCOUNT_FORMAT_VERSION {
         return Err(CryptoError::UnsupportedVersion(keyset.version));
+    }
+    if keyset.version < ACCOUNT_MIN_READABLE_VERSION {
+        return Err(CryptoError::SchemaTooOld(keyset.version));
     }
     let wrapped = keyset
         .wrapped_ark_recovery
@@ -545,8 +558,11 @@ pub fn unlock_account_via_biometric(
     envelope: &AccountBiometricEnvelope,
     keyset: &AccountKeySet,
 ) -> Result<UnlockedAccount> {
-    if envelope.version != ACCOUNT_FORMAT_VERSION {
+    if envelope.version > ACCOUNT_FORMAT_VERSION {
         return Err(CryptoError::UnsupportedVersion(envelope.version));
+    }
+    if envelope.version < ACCOUNT_MIN_READABLE_VERSION {
+        return Err(CryptoError::SchemaTooOld(envelope.version));
     }
     if envelope.account_id != keyset.account_id {
         return Err(CryptoError::DecryptFailed);

@@ -25,6 +25,9 @@ use crate::vault::{aad_for_item_blob, aad_for_item_key, UnlockedVault};
 ///   把一条 item 的密文换位/回滚/复制到另一条(否则 AAD 不匹配、解密失败)。
 pub const ITEM_FORMAT_VERSION: u16 = 3;
 
+/// 能读到多老的 item 封装格式。**提高它之前必须先写好迁移**。
+pub const ITEM_MIN_READABLE_VERSION: u16 = 3;
+
 /// 持久化的单条 item 密文。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EncryptedItemBlob {
@@ -80,8 +83,11 @@ pub fn decrypt_item(
     item_id: &[u8; 16],
     vault: &UnlockedVault,
 ) -> Result<Zeroizing<Vec<u8>>> {
-    if encrypted.version != ITEM_FORMAT_VERSION {
+    if encrypted.version > ITEM_FORMAT_VERSION {
         return Err(crate::CryptoError::UnsupportedVersion(encrypted.version));
+    }
+    if encrypted.version < ITEM_MIN_READABLE_VERSION {
+        return Err(crate::CryptoError::SchemaTooOld(encrypted.version));
     }
 
     let item_key_inner = unwrap_key(
@@ -109,8 +115,11 @@ pub fn rewrap_item_key(
     encrypted: &EncryptedItemBlob,
     item_id: &[u8; 16],
 ) -> Result<EncryptedItemBlob> {
-    if encrypted.version != ITEM_FORMAT_VERSION {
+    if encrypted.version > ITEM_FORMAT_VERSION {
         return Err(crate::CryptoError::UnsupportedVersion(encrypted.version));
+    }
+    if encrypted.version < ITEM_MIN_READABLE_VERSION {
+        return Err(crate::CryptoError::SchemaTooOld(encrypted.version));
     }
     // 旧 IKEK 解出 ItemKey
     let item_key = unwrap_key(

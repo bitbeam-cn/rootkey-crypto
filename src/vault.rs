@@ -17,6 +17,9 @@ use crate::random;
 /// v2:密钥包裹 AEAD 从 AES-256-GCM 升级为 AES-256-GCM-SIV(RFC 8452)。
 pub const KEYSET_FORMAT_VERSION: u16 = 2;
 
+/// 能读到多老的密钥集格式。**提高它之前必须先写好迁移**。
+pub const KEYSET_MIN_READABLE_VERSION: u16 = 2;
+
 /// 16 字节随机 ID(account / vault)。
 pub type Id = [u8; 16];
 
@@ -140,8 +143,11 @@ pub fn unlock_vault(
     master_password: &str,
     keyset: &EncryptedKeySet,
 ) -> Result<UnlockedVault> {
-    if keyset.version != KEYSET_FORMAT_VERSION {
+    if keyset.version > KEYSET_FORMAT_VERSION {
         return Err(CryptoError::UnsupportedVersion(keyset.version));
+    }
+    if keyset.version < KEYSET_MIN_READABLE_VERSION {
+        return Err(CryptoError::SchemaTooOld(keyset.version));
     }
     keyset.kdf.validate()?;
 
@@ -402,8 +408,11 @@ pub fn unlock_via_biometric(
     envelope: &BiometricEnvelope,
     keyset: &EncryptedKeySet,
 ) -> Result<UnlockedVault> {
-    if envelope.version != KEYSET_FORMAT_VERSION {
+    if envelope.version > KEYSET_FORMAT_VERSION {
         return Err(CryptoError::UnsupportedVersion(envelope.version));
+    }
+    if envelope.version < KEYSET_MIN_READABLE_VERSION {
+        return Err(CryptoError::SchemaTooOld(envelope.version));
     }
     if envelope.vault_id != keyset.vault_id {
         return Err(CryptoError::DecryptFailed);

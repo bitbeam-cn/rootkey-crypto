@@ -33,9 +33,19 @@ pub enum CryptoError {
     #[error("serialization failed")]
     SerializationFailed,
 
-    /// 加密格式版本不被本客户端支持。
+    /// 数据的格式版本**比本客户端新** —— 这份数据由更新版本的 RootKey 写出。
+    ///
+    /// 用户动作:升级 App。**绝不能**因为读不懂就重写/重置这份数据。
     #[error("unsupported format version: {0}")]
     UnsupportedVersion(u16),
+
+    /// 数据的格式版本**比本客户端能读的最老版本还老**。
+    ///
+    /// 用户动作:先用一个中间版本打开一次完成升级,再装最新版。
+    /// 与 [`CryptoError::UnsupportedVersion`] 分开,是因为两者的用户指引完全相反 ——
+    /// 一个要往新装,一个要往旧装,合成一条文案必然误导其中一半人。
+    #[error("format version too old: {0}")]
+    SchemaTooOld(u16),
 
     /// Ed25519 签名校验失败 —— 消息被篡改、签名损坏、或公钥不对。
     /// 与 [`CryptoError::DecryptFailed`] 一样不细分原因,防侧信道。

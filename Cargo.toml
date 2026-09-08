@@ -1,6 +1,6 @@
 [package]
 name = "rootkey-crypto"
-version = "0.1.0"
+version = "0.6.0"
 edition = "2021"
 # MSRV 1.89:dryoc 1.0 要求(其 sealed box 的 seal 路径会拒绝低阶点公钥)。
 rust-version = "1.89"
