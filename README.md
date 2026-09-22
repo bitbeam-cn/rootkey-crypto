@@ -93,6 +93,39 @@ find src -type f ! -name '.*' | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 
 > 目前验证的是**源码**同源。二进制级的可复现构建(从本仓编出与发行版逐字节相同的产物)
 > 还在路线图上 —— Flutter + Rust FFI 的全链路确定性构建尚未完成,我们不假装已经做到。
 
+### 为什么多个版本的 tag 指向同一份代码
+
+**因为那几版之间 `crypto_core` 一个字节都没改。**
+
+产品(App)的版本号和加密核心的改动节奏是脱钩的 —— 一次发版可能只动 UI、同步、
+商店文案或别的 crate,完全不碰加密层。这种时候本仓仍然打上对应产品版本的 tag,
+让你能用产品版本号直接 checkout,但它的 `src/` 和上一个 tag 是同一份。
+
+按 `src/` 源码树哈希实算,至今只有两组:
+
+| 产品版本区间 | `src/` 树哈希 | 那一组里改了什么 |
+|---|---|---|
+| `v0.4.0` – `v0.4.1` | `560cf8a94a610d11…` | 格式硬化四件套、AEAD 与 dalek 升级 |
+| `v0.6.0` – `v0.13.0` | `ffa1d8f419ca2cbd…` | IKEK 旋转、格式版本区间检查、v2 库兼容 fixture |
+
+(注意 `v0.4.0` 与 `v0.4.1`、`v0.6.0` 与 `v0.6.2` 之间各有一次提交,改的是
+README 与 `Cargo.lock`,没有触及 `src/` —— 所以树哈希不变。)
+
+**怎么自己核对**:任取两个 tag 比较,同组的应当完全相同、跨组的应当不同 ——
+
+```bash
+for t in v0.4.1 v0.6.0 v0.13.0; do
+  git checkout -q "$t"
+  printf '%-10s ' "$t"
+  find src -type f ! -name '.*' | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 256
+done
+```
+
+预期:`v0.4.1` 一个值,`v0.6.0` 与 `v0.13.0` 另一个值且彼此相同。
+⚠️ 跑之前先确保工作区干净(`git status`),否则 `git checkout` 会被未提交的改动挡下,
+你会在同一个工作树状态下算出一串假的"相同哈希"。
+
+
 ## 文档
 
 - [`docs/SECURITY_MODEL.md`](docs/SECURITY_MODEL.md) — 密码学规约(与代码强契约)
