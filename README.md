@@ -106,7 +106,7 @@ find src -type f ! -name '.*' | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 
 | 产品版本区间 | `src/` 树哈希 | 那一组里改了什么 |
 |---|---|---|
 | `v0.4.0` – `v0.4.1` | `560cf8a94a610d11…` | 格式硬化四件套、AEAD 与 dalek 升级 |
-| `v0.6.0` – `v0.15.0` | `ffa1d8f419ca2cbd…` | IKEK 旋转、格式版本区间检查、v2 库兼容 fixture |
+| `v0.6.0` – `v0.15.1` | `ffa1d8f419ca2cbd…` | IKEK 旋转、格式版本区间检查、v2 库兼容 fixture |
 
 (注意 `v0.4.0` 与 `v0.4.1`、`v0.6.0` 与 `v0.6.2` 之间各有一次提交,改的是
 README 与 `Cargo.lock`,没有触及 `src/` —— 所以树哈希不变。)
@@ -114,14 +114,14 @@ README 与 `Cargo.lock`,没有触及 `src/` —— 所以树哈希不变。)
 **怎么自己核对**:任取两个 tag 比较,同组的应当完全相同、跨组的应当不同 ——
 
 ```bash
-for t in v0.4.1 v0.6.0 v0.15.0; do
+for t in v0.4.1 v0.6.0 v0.15.1; do
   git checkout -q "$t"
   printf '%-10s ' "$t"
   find src -type f ! -name '.*' | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 256
 done
 ```
 
-预期:`v0.4.1` 一个值,`v0.6.0` 与 `v0.15.0` 另一个值且彼此相同。
+预期:`v0.4.1` 一个值,`v0.6.0` 与 `v0.15.1` 另一个值且彼此相同。
 ⚠️ 跑之前先确保工作区干净(`git status`),否则 `git checkout` 会被未提交的改动挡下,
 你会在同一个工作树状态下算出一串假的"相同哈希"。
 
