@@ -128,6 +128,13 @@ KDF 参数序列化(`KdfParams::aad_bytes`):算法标识(1B) || memory_kib(BE u3
 - 共享密封盒:`SealedSharedKey` 前置 1 字节版本前缀(`SEALED_FORMAT_V1`),为后量子 hybrid /
   格式演进留门。
 
+**锁定期间的写入暂存(v0.18.0)**:保险库锁着时,允许把待写入的内容先密封存盘,解锁后再入库。
+用的是同一个密封盒(libsodium `crypto_box_seal`,同样带 `SEALED_FORMAT_V1` 前缀),只是载荷从
+32 字节密钥放宽为任意字节(`seal_bytes_for` / `open_sealed_bytes`)。收件方的 X25519 密钥对
+**由账户根密钥(ARK)派生**:`BLAKE3 derive_key("root-key/ai-inbox/v1", ARK || account_id)`,
+私钥不落盘,只有解锁后才算得出来;磁盘上只放公钥。因此锁定状态下**只能写、不能读**已暂存的内容。
+改主密码不换 ARK,这对密钥保持稳定;轮换 ARK 后旧的暂存内容不可再打开。
+
 ## 5. 忘记主密码 = 凭恢复密钥重设(主密码与恢复密钥同时丢失才丢数据)
 
 ADR-010 后有**恢复密钥**这条正规找回路径,但仍**无 Secret Key、无 Emergency Access、服务器不留任何凭据**:

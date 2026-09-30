@@ -27,7 +27,7 @@
 
 
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::aead::{unwrap_key, wrap_key, WrappedKey};
 use crate::error::{CryptoError, Result};
@@ -104,6 +104,20 @@ pub struct UnlockedAccount {
     /// 账户 ID。
     pub account_id: Id,
     pub(crate) ark: AccountRootKey,
+}
+
+impl UnlockedAccount {
+    /// AI 收件箱的 X25519 密钥对:由 ARK 派生,不另存私钥。公钥明文放盘上,
+    /// 锁着时 MCP 写入用它密封;私钥只在解锁后(有 ARK)才派生得出。
+    /// 换主密码不换 ARK(只重新包装),所以收件箱密钥跨改密码稳定;轮换 ARK 后旧收件箱打不开。
+    pub fn ai_inbox_keypair(&self) -> crate::shared_vault::SharedIdentityKeyPair {
+        let mut material = Vec::with_capacity(48);
+        material.extend_from_slice(self.ark.expose_secret());
+        material.extend_from_slice(&self.account_id);
+        let secret = blake3::derive_key("root-key/ai-inbox/v1", &material);
+        material.zeroize();
+        crate::shared_vault::SharedIdentityKeyPair::from_secret(secret)
+    }
 }
 
 impl core::fmt::Debug for UnlockedAccount {
@@ -869,5 +883,21 @@ mod tests {
             s.push_str(&format!("{byte:02x}"));
         }
         s
+    }
+}
+
+#[cfg(test)]
+mod ai_inbox_tests {
+    use super::*;
+
+    #[test]
+    fn inbox_keypair_is_stable_across_unlocks() {
+        let keys = create_account("pw-for-test").unwrap();
+        let a1 = unlock_account("pw-for-test", &keys.encrypted).unwrap();
+        let a2 = unlock_account("pw-for-test", &keys.encrypted).unwrap();
+        assert_eq!(a1.ai_inbox_keypair().public_key(), a2.ai_inbox_keypair().public_key());
+        // 不同账户的收件箱密钥不同
+        let other = create_account("pw-for-test").unwrap();
+        assert_ne!(other.unlocked.ai_inbox_keypair().public_key(), a1.ai_inbox_keypair().public_key());
     }
 }

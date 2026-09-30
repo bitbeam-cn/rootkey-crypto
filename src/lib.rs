@@ -83,6 +83,7 @@ pub use shared_vault::{
     decrypt_shared_item, encrypt_shared_item, EncryptedSharedItem, SHARED_ITEM_VERSION,
 };
 pub use share::{open_share, seal_share, ShareBlob, ShareKey};
+pub use shared_vault::{open_sealed_bytes, seal_bytes_for, SharedIdentityKeyPair, X25519_PUBLIC_KEY_LEN};
 pub use signing::{Signature, SigningKey, VerifyingKey};
 pub use vault::{
     change_master_password, create_vault_keys, enable_biometric_unlock, rotate_ikek,

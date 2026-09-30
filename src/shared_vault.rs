@@ -244,6 +244,27 @@ pub fn wrap_for_recipient(
     Ok(SealedSharedKey(out))
 }
 
+/// 任意字节的 sealed box(AI 收件箱用:锁着时只有公钥,写进去的东西只有解锁后才打得开)。
+/// 格式同 [`wrap_for_recipient`]:版本前缀 + libsodium `crypto_box_seal` 字节。
+pub fn seal_bytes_for(recipient_pubkey: &[u8; X25519_PUBLIC_KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
+    let recipient_pk = PublicKey::from(*recipient_pubkey);
+    let sealed = DryocBox::seal_to_vecbox(plaintext, &recipient_pk).map_err(|_| CryptoError::EncryptFailed)?;
+    let body = sealed.to_vec();
+    let mut out = Vec::with_capacity(1 + body.len());
+    out.push(SEALED_FORMAT_V1);
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// [`seal_bytes_for`] 的逆:用自己的 X25519 keypair 打开。
+pub fn open_sealed_bytes(sealed: &[u8], identity: &SharedIdentityKeyPair) -> Result<Vec<u8>> {
+    if sealed.first() != Some(&SEALED_FORMAT_V1) {
+        return Err(CryptoError::DecryptFailed);
+    }
+    let dbox = DryocBox::from_sealed_bytes(&sealed[1..]).map_err(|_| CryptoError::DecryptFailed)?;
+    dbox.unseal_to_vec(&identity.dryoc_keypair()).map_err(|_| CryptoError::DecryptFailed)
+}
+
 /// recipient 用自己的 X25519 keypair open sealed box,拿回 shared_vault_key。
 pub fn unwrap_with_identity(
     sealed: &SealedSharedKey,
@@ -521,5 +542,15 @@ mod tests {
         assert_eq!(w.0.len(), SealedSharedKey::EXPECTED_LEN);
         assert_eq!(SealedSharedKey::EXPECTED_LEN, 81);
         assert_eq!(w.0[0], SEALED_FORMAT_V1);
+    }
+
+    #[test]
+    fn seal_bytes_round_trip_and_wrong_key_fails() {
+        let kp = SharedIdentityKeyPair::generate().unwrap();
+        let other = SharedIdentityKeyPair::generate().unwrap();
+        let sealed = seal_bytes_for(&kp.public_key(), b"{\"type\":\"cli_create\"}").unwrap();
+        assert_eq!(open_sealed_bytes(&sealed, &kp).unwrap(), b"{\"type\":\"cli_create\"}");
+        assert!(open_sealed_bytes(&sealed, &other).is_err());
+        assert!(open_sealed_bytes(&sealed[1..], &kp).is_err(), "no version prefix");
     }
 }
