@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # 依赖漏洞公告随时会新出,代码不动也要定期查
+  schedule:
+    - cron: '0 2 * * 1'
 
 jobs:
   test:
@@ -16,3 +19,12 @@ jobs:
         run: cargo test --release
       - name: Build docs
         run: cargo doc --no-deps
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependency advisories (RustSec)
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit --deny warnings
