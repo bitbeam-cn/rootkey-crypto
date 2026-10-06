@@ -120,6 +120,23 @@ impl UnlockedAccount {
     }
 }
 
+impl UnlockedAccount {
+    /// 远程确认中继的认证密钥(2026-10-06,威胁模型 L9)。
+    ///
+    /// 中继信封是匿名密封盒,谁都能封给某台设备 —— 服务器被攻破就能伪造「AI 要读 X」的
+    /// 请求骗手机批准,或伪造答复给电脑塞假值。同一账户的设备都能由 ARK 派生出这把密钥,
+    /// 请求和答复带它算的认证码,别人造不出来。调用方可把它存进钥匙串(电脑锁着时也要
+    /// 校验手机的答复),它只认证中继消息,解不开任何保险库数据。
+    pub fn relay_auth_key(&self) -> Zeroizing<[u8; 32]> {
+        let mut material = Vec::with_capacity(48);
+        material.extend_from_slice(self.ark.expose_secret());
+        material.extend_from_slice(&self.account_id);
+        let k = blake3::derive_key("root-key/relay-auth/v1", &material);
+        material.zeroize();
+        Zeroizing::new(k)
+    }
+}
+
 impl core::fmt::Debug for UnlockedAccount {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("UnlockedAccount")
@@ -266,6 +283,105 @@ pub fn unlock_account_vault(
         vmk,
         ikek: ItemKekKey::from_symmetric(ikek_inner),
     })
+}
+
+/// [`rekey_account`] 的结果中的一个 vault:旧 / 新解锁句柄 + 新的持久化记录。
+pub struct RekeyedVault {
+    /// 用旧密钥解开的 vault —— 重加密时解旧数据用,用完即丢。
+    pub old: UnlockedVault,
+    /// 新密钥 —— 重加密写新数据用。
+    pub new: UnlockedVault,
+    /// 新 KEK(由新 ARK 包)。
+    pub entry: AccountVaultEntry,
+    /// 新 VMK / IKEK 残余(vault_id 不变)。
+    pub slot: VaultKeySlot,
+}
+
+/// [`rekey_account`] 的结果。
+pub struct RekeyedAccount {
+    /// 新的账户持久化部分:新 KDF 盐、新 ARK、每个库新 KEK;恢复密钥包装被清空。
+    pub encrypted: AccountKeySet,
+    /// 新 ARK 的解锁上下文。
+    pub unlocked: UnlockedAccount,
+    /// 每个库的新旧密钥,顺序同调用方传入的 `slots`。
+    pub vaults: Vec<RekeyedVault>,
+}
+
+/// 怀疑主密码泄露时更换整条密钥链(ADR-014 方案 A,威胁模型 L12)。
+///
+/// 只改主密码时 ARK 和以下各层都不变,拿着旧主密码 + 旧密钥包的人照样能解开之后写的数据;
+/// 只换 ARK 也不够 —— KEK 不变,旧 ARK 解旧包装即得 KEK。这里**全换**:新 KDF 盐 + 新 ARK,
+/// 每个库新 KEK / VMK / IKEK(vault_id 不变)。调用方随后要用 `vaults[i].old` 解、`.new` 重新
+/// 加密库里的全部数据(条目、历史、附件、索引…),并善后:恢复密钥需重新生成(这里已清空
+/// 包装)、生物识别信封作废、库身份(identity.secret.enc,绑 KEK)重包。
+///
+/// `slots` 必须覆盖账户下的**全部**库,漏一个就报错 —— 否则那个库的 KEK 还被旧 ARK 包着,
+/// 新 ARK 打不开它。
+pub fn rekey_account(
+    old_password: &str,
+    new_password: &str,
+    current: &AccountKeySet,
+    slots: &[VaultKeySlot],
+) -> Result<RekeyedAccount> {
+    if new_password.is_empty() {
+        return Err(CryptoError::InvalidArgument("new password is empty"));
+    }
+    let old = unlock_account(old_password, current)?;
+    if slots.len() != current.vaults.len()
+        || !current.vaults.iter().all(|e| slots.iter().any(|s| s.vault_id == e.vault_id))
+    {
+        return Err(CryptoError::InvalidArgument("rekey must cover every vault of the account"));
+    }
+    let new_ark = AccountRootKey::generate()?;
+    let new_kdf = KdfParams::generate_default()?;
+    let new_muk = derive_muk(new_password, &new_kdf)?;
+    let wrapped_ark = wrap_key(&new_muk.0, &new_ark.0, &aad_for_ark(&current.account_id, &new_kdf))?;
+    let unlocked = UnlockedAccount { account_id: current.account_id, ark: new_ark };
+
+    let mut vaults = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let entry = current
+            .vaults
+            .iter()
+            .find(|e| e.vault_id == slot.vault_id)
+            .ok_or(CryptoError::InvalidArgument("slot without account entry"))?;
+        let old_vault = unlock_account_vault(&old, entry, slot)?;
+        let vault_id = slot.vault_id;
+        let kek = KeyEncryptionKey::generate()?;
+        let vmk = VaultMasterKey::generate()?;
+        let ikek = ItemKekKey::generate()?;
+        let new_entry = AccountVaultEntry {
+            vault_id,
+            wrapped_kek: wrap_key(
+                &unlocked.ark.0,
+                &kek.0,
+                &aad_for_vault_kek(&current.account_id, &vault_id),
+            )?,
+        };
+        let new_slot = VaultKeySlot {
+            version: ACCOUNT_FORMAT_VERSION,
+            account_id: current.account_id,
+            vault_id,
+            wrapped_vmk: wrap_key(&kek.0, &vmk.0, &aad_for_vmk(&current.account_id, &vault_id))?,
+            wrapped_ikek: wrap_key(&vmk.0, &ikek.0, &aad_for_ikek(&vault_id))?,
+        };
+        vaults.push(RekeyedVault {
+            old: old_vault,
+            new: UnlockedVault { account_id: current.account_id, vault_id, kek, vmk, ikek },
+            entry: new_entry,
+            slot: new_slot,
+        });
+    }
+    let encrypted = AccountKeySet {
+        version: ACCOUNT_FORMAT_VERSION,
+        account_id: current.account_id,
+        created_at: current.created_at,
+        kdf: new_kdf,
+        wrapped_ark,
+        wrapped_ark_recovery: None,
+        vaults: vaults.iter().map(|v| v.entry.clone()).collect(),
+    };
+    Ok(RekeyedAccount { encrypted, unlocked, vaults })
 }
 
 /// 在已解锁账户下新建 vault(**不需要**主密码 —— ARK 在内存)。
@@ -598,6 +714,36 @@ mod tests {
     use super::*;
     use crate::item::{decrypt_item, encrypt_item};
     use crate::vault::create_vault_keys;
+
+    #[test]
+    fn rekey_account_replaces_whole_chain() {
+        let keys = create_account("old-password-1").unwrap();
+        let v = create_vault_under_account(&keys.unlocked).unwrap();
+        let mut ks = keys.encrypted.clone();
+        ks.vaults.push(v.entry.clone());
+        let old_vault = unlock_account_vault(&keys.unlocked, &v.entry, &v.slot).unwrap();
+        let blob = encrypt_item(b"secret", &[9u8; 16], &old_vault).unwrap();
+
+        let r = rekey_account("old-password-1", "new-password-2", &ks, &[v.slot.clone()]).unwrap();
+        let rv = &r.vaults[0];
+        assert_eq!(rv.slot.vault_id, v.slot.vault_id, "库 id 不变");
+        // 旧数据:旧句柄能解,新句柄解不了 → 重加密后新句柄能解
+        assert_eq!(&*decrypt_item(&blob, &[9u8; 16], &rv.old).unwrap(), b"secret");
+        assert!(decrypt_item(&blob, &[9u8; 16], &rv.new).is_err());
+        let re = encrypt_item(&decrypt_item(&blob, &[9u8; 16], &rv.old).unwrap(), &[9u8; 16], &rv.new).unwrap();
+        // 新主密码 + 新记录 → 能开新库
+        let acct = unlock_account("new-password-2", &r.encrypted).unwrap();
+        let nv = unlock_account_vault(&acct, &r.encrypted.vaults[0], &rv.slot).unwrap();
+        assert_eq!(&*decrypt_item(&re, &[9u8; 16], &nv).unwrap(), b"secret");
+        // 攻击者:旧主密码 + 旧账户包 → 旧 ARK;拿它去解新的 KEK 包装 / 新数据,都不行
+        assert!(unlock_account("old-password-1", &r.encrypted).is_err());
+        let old_acct = unlock_account("old-password-1", &ks).unwrap();
+        assert!(unlock_account_vault(&old_acct, &r.encrypted.vaults[0], &rv.slot).is_err());
+        assert!(unlock_account_vault(&old_acct, &v.entry, &rv.slot).is_err());
+        // 恢复密钥包装被清空;漏掉库要报错
+        assert!(r.encrypted.wrapped_ark_recovery.is_none());
+        assert!(rekey_account("old-password-1", "x", &ks, &[]).is_err());
+    }
 
     #[test]
     fn create_then_unlock_round_trip() {
