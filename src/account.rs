@@ -137,6 +137,31 @@ impl UnlockedAccount {
     }
 }
 
+impl UnlockedAccount {
+    /// 远程放行(ADR-015):手机把账户根密钥交给**同一账户**的电脑,电脑据此给发起请求的 AI
+    /// 开一个限时会话。调用方必须先把它密封给对方设备公钥并附账户认证码(见 ffi_bridge relay),
+    /// 本函数只负责把密钥取出来。电脑正常解锁后本来就持有同一把 ARK,交出去不扩大暴露面。
+    pub fn export_ark_for_handoff(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(*self.ark.expose_secret())
+    }
+}
+
+/// 电脑端:用手机交来的 ARK 打开账户(ADR-015)。必须能解开本机密钥包里第一个保险库的 KEK ——
+/// 别的账户的 ARK、或本机已换过密钥(L12)而手机还是旧的,一律 `DecryptFailed`。
+pub fn unlock_account_with_ark(ark: &[u8; 32], keyset: &AccountKeySet) -> Result<UnlockedAccount> {
+    let account = UnlockedAccount {
+        account_id: keyset.account_id,
+        ark: AccountRootKey::from_symmetric(SymmetricKey::try_from_slice(ark)?),
+    };
+    let entry = keyset.vaults.first().ok_or(CryptoError::DecryptFailed)?;
+    unwrap_key(
+        &account.ark.0,
+        &entry.wrapped_kek,
+        &aad_for_vault_kek(&account.account_id, &entry.vault_id),
+    )?;
+    Ok(account)
+}
+
 impl core::fmt::Debug for UnlockedAccount {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("UnlockedAccount")
@@ -743,6 +768,24 @@ mod tests {
         // 恢复密钥包装被清空;漏掉库要报错
         assert!(r.encrypted.wrapped_ark_recovery.is_none());
         assert!(rekey_account("old-password-1", "x", &ks, &[]).is_err());
+    }
+
+    #[test]
+    fn ark_handoff_opens_same_account_only() {
+        let keys = create_account("phone-and-mac-share-this").unwrap();
+        let v = create_vault_under_account(&keys.unlocked).unwrap();
+        let mut ks = keys.encrypted.clone();
+        ks.vaults.push(v.entry.clone());
+        let ark = keys.unlocked.export_ark_for_handoff();
+        let acct = unlock_account_with_ark(&ark, &ks).unwrap();
+        assert_eq!(acct.account_id, ks.account_id);
+        assert!(unlock_account_vault(&acct, &v.entry, &v.slot).is_ok());
+        // 别的账户的 ARK、随便一串字节 → 拒绝
+        let other = create_account("someone-else").unwrap();
+        assert!(unlock_account_with_ark(&other.unlocked.export_ark_for_handoff(), &ks).is_err());
+        assert!(unlock_account_with_ark(&[7u8; 32], &ks).is_err());
+        // 没有任何保险库的密钥包无从校验 → 拒绝
+        assert!(unlock_account_with_ark(&ark, &keys.encrypted).is_err());
     }
 
     #[test]

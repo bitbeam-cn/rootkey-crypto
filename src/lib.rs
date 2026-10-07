@@ -63,7 +63,7 @@ pub mod signing;
 pub mod vault;
 
 pub use account::{
-    change_account_password, create_account, rekey_account, RekeyedAccount,
+    change_account_password, unlock_account_with_ark, create_account, rekey_account, RekeyedAccount,
     RekeyedVault, create_vault_under_account,
     reset_password_with_recovery_key, rotate_account_root_key, setup_recovery_key,
     unlock_account_with_recovery_key,
