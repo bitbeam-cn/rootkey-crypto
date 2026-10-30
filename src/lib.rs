@@ -58,6 +58,7 @@ pub mod kdf;
 pub mod keys;
 pub mod random;
 pub mod share;
+pub mod shared_account;
 pub mod shared_vault;
 pub mod signing;
 pub mod vault;
@@ -94,6 +95,9 @@ pub use vault::{
     KEYSET_FORMAT_VERSION,
 };
 pub use aead::WrappedKey;
+pub use shared_account::{
+    attach_shared_vault_under_account, reattach_vault_under_account, rotate_shared_vault_keys,
+};
 
 /// 当前 crypto_core 的版本字符串。
 pub fn version() -> &'static str {

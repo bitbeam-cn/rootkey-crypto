@@ -203,7 +203,7 @@ fn aad_for_ark(account_id: &Id, kdf: &KdfParams) -> Vec<u8> {
     out
 }
 
-fn aad_for_vault_kek(account_id: &Id, vault_id: &Id) -> Vec<u8> {
+pub(crate) fn aad_for_vault_kek(account_id: &Id, vault_id: &Id) -> Vec<u8> {
     let mut out = Vec::with_capacity(AAD_PREFIX.len() + 24 + 16 + 16);
     out.extend_from_slice(AAD_PREFIX);
     out.extend_from_slice(b"/wrap-vault-kek/v1/");

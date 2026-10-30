@@ -69,7 +69,7 @@ ItemKey 加密(密文即便很大也不动),ItemKey 被 IKEK 包裹,逐层上包
 | ARK(账户根密钥) | `rotate_account_root_key` | 重包账户下每个 vault 的 KEK;KEK 以下不动 | O(vault 数) | ARK 疑似泄露(改密码救不回时) |
 | VMK | `rotate_vault_key` | 重包 IKEK + 原子重包 signing seed;**IKEK 值不变、item 零重写** | O(1) | 常规轮换 |
 | **IKEK** | `rotate_ikek` + 逐条 `rewrap_item_key`(vault 层 `rekey_items` 编排) | 重包**每条 item 的 wrapped_item_key**;ItemKey 值与 item 密文/payload 完全不动 | O(条目数) | **IKEK 疑似泄露 = 全库条目暴露的止损** |
-| 共享库密钥 | `rotate_shared_vault_key` | 重新分发给剩余成员(软撤销:只保护未来条目) | O(成员数) | 踢人 / 疑似共享密钥泄露 |
+| 共享库密钥 | `rotate_shared_vault_key` + `rotate_shared_vault_keys` | 新钥匙分发给剩余成员,各自改由新钥匙派生 VMK / IKEK;产品在移出成员时随后用新钥匙把全库条目重新加密、重新上传(被移出者已拿到的旧副本收不回,之后的内容读不到) | O(成员数) + O(条目数) | 移出成员 / 疑似共享密钥泄露 |
 | 恢复密钥 / 生物识别 | 重调 `setup_recovery_key` / `enable_*_biometric` | 只重包 ARK 一条(旁路包装) | O(1) | 换应急套件 / 重新登记指纹 |
 
 **IKEK 旋转是这里唯一 O(条目数) 的**——因为 IKEK 直接包裹每条 ItemKey——但它也只重包那把
@@ -77,6 +77,21 @@ ItemKey 加密(密文即便很大也不动),ItemKey 被 IKEK 包裹,逐层上包
 IKEK 需要 `rotate_ikek` 这条独立止损路径:IKEK 一旦泄露等于全库条目暴露,换 IKEK 让泄露副本
 作废。`rekey_items` 编排时逐条读取走带签名校验的路径,**重包前先验旧签名**,避免把被篡改
 文件洗白重签。
+
+### 2.2 共享库挂进账户(`shared_account.rs`)
+
+共享库在每个成员本机都是一个普通的账户内保险库,差别只在 VMK / IKEK 从哪来:不随机生成,
+而由成员间分发的 `shared_vault_key`(每人一份密封盒)经 BLAKE3 `derive_key` 派生,输入拼上
+vault_id(域标签 `root-key/shared-vault-vmk/v1` / `root-key/shared-vault-ikek/v1`)—— 同一把
+钥匙用到别的库上派生出的是另一对,防跨库复用。
+
+条目密钥、条目密文、IKEK 包装的 AAD 只绑 vault_id,所以全体成员读写同一份密文;KEK → VMK
+这一层绑各自的账户 ID,每个成员用**自己账户**新生成的 KEK 包同一份 VMK,解锁时跟自己的库一起打开。
+
+- `attach_shared_vault_under_account`:建库、加入、换钥匙后重新挂载都走这一条
+- `rotate_shared_vault_keys`:移出成员后沿用本机 KEK,VMK / IKEK 改由新钥匙派生,只换库的 keyslot
+- `reattach_vault_under_account`:本人换整条密钥链(新 ARK)时只换本机 KEK 这层包装;VMK / IKEK
+  是全体成员共用的,不能动
 
 ## 3. 算法选型与默认参数
 
