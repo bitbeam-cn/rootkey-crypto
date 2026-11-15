@@ -12,6 +12,7 @@ use zeroize::Zeroizing;
 use crate::aead::{open_blob, seal_blob, SealedBlob};
 use crate::error::{CryptoError, Result};
 use crate::kdf::{derive_muk, KdfParams};
+use crate::keys::MasterUnlockKey;
 
 /// 导出包格式版本。变更值意味着不向后兼容,旧客户端拒绝解。
 pub const EXPORT_MAGIC: &str = "ROOTKEY_VAULT_BACKUP_V1";
@@ -29,25 +30,75 @@ pub struct EncryptedBundle {
 
 /// 用密码加密任意 plaintext 字节。返回的 bundle 可序列化为 JSON。
 pub fn seal_with_password(password: &str, plaintext: &[u8]) -> Result<EncryptedBundle> {
-    let kdf = KdfParams::generate_default()?;
-    let muk = derive_muk(password, &kdf)?;
-    let aad = aad_bytes(&kdf);
-    let blob = seal_blob(&muk.0, plaintext, &aad)?;
-    Ok(EncryptedBundle {
-        magic: EXPORT_MAGIC.to_string(),
-        kdf,
-        blob,
-    })
+    BackupSession::create(password)?.seal_main(plaintext)
 }
 
 /// 用密码解开 bundle,返回 zeroize 包装的明文。
 pub fn open_with_password(password: &str, bundle: &EncryptedBundle) -> Result<Zeroizing<Vec<u8>>> {
-    if bundle.magic != EXPORT_MAGIC {
-        return Err(CryptoError::InvalidArgument("bundle magic mismatch"));
+    BackupSession::for_bundle(password, bundle)?.open_main(bundle)
+}
+
+/// 同一个导出密码下加密 / 解开多段数据的会话:Argon2id 只跑一次。
+///
+/// 备份除了主体(全部条目,[`EncryptedBundle`])还要带附件。附件逐个单独加密、
+/// 逐个写盘,这样整份备份不必同时放在内存里;每跑一次 Argon2id 要上百毫秒和几十 MB 内存,
+/// 所以密钥只派生一次,各段共用。
+///
+/// 各段用同一把密钥、各自随机的 24 字节 nonce;AAD 把每段绑在「这份备份(KDF 参数)+
+/// 这一段的标签」上:主体和附件互相替换不了,两个附件对调、挪到另一份备份里也都解不开。
+pub struct BackupSession {
+    muk: MasterUnlockKey,
+    kdf: KdfParams,
+}
+
+impl BackupSession {
+    /// 新建一份备份:随机盐,派生密钥。
+    pub fn create(password: &str) -> Result<Self> {
+        let kdf = KdfParams::generate_default()?;
+        let muk = derive_muk(password, &kdf)?;
+        Ok(Self { muk, kdf })
     }
-    let muk = derive_muk(password, &bundle.kdf)?;
-    let aad = aad_bytes(&bundle.kdf);
-    open_blob(&muk.0, &bundle.blob, &aad)
+
+    /// 打开已有的备份:按包里的 KDF 参数派生密钥。
+    /// 密码对不对在这里看不出来,要到 [`Self::open_main`] 解主体时才知道。
+    pub fn for_bundle(password: &str, bundle: &EncryptedBundle) -> Result<Self> {
+        if bundle.magic != EXPORT_MAGIC {
+            return Err(CryptoError::InvalidArgument("bundle magic mismatch"));
+        }
+        let muk = derive_muk(password, &bundle.kdf)?;
+        Ok(Self {
+            muk,
+            kdf: bundle.kdf.clone(),
+        })
+    }
+
+    /// 加密主体。
+    pub fn seal_main(&self, plaintext: &[u8]) -> Result<EncryptedBundle> {
+        let blob = seal_blob(&self.muk.0, plaintext, &aad_bytes(&self.kdf))?;
+        Ok(EncryptedBundle {
+            magic: EXPORT_MAGIC.to_string(),
+            kdf: self.kdf.clone(),
+            blob,
+        })
+    }
+
+    /// 解开主体。密码不对、内容被改都在这里失败。
+    pub fn open_main(&self, bundle: &EncryptedBundle) -> Result<Zeroizing<Vec<u8>>> {
+        if bundle.magic != EXPORT_MAGIC {
+            return Err(CryptoError::InvalidArgument("bundle magic mismatch"));
+        }
+        open_blob(&self.muk.0, &bundle.blob, &aad_bytes(&bundle.kdf))
+    }
+
+    /// 加密主体之外的一段(一个附件)。`label` 是这一段的身份(附件 id),进 AAD。
+    pub fn seal_part(&self, label: &[u8], plaintext: &[u8]) -> Result<SealedBlob> {
+        seal_blob(&self.muk.0, plaintext, &part_aad(&self.kdf, label))
+    }
+
+    /// 解开一段。`label` 必须和加密时相同。
+    pub fn open_part(&self, label: &[u8], blob: &SealedBlob) -> Result<Zeroizing<Vec<u8>>> {
+        open_blob(&self.muk.0, blob, &part_aad(&self.kdf, label))
+    }
 }
 
 /// 把 KDF 参数序列化为 AAD,绑定密文与 KDF 上下文(防降级 / 篡改攻击)。
@@ -55,6 +106,14 @@ fn aad_bytes(kdf: &KdfParams) -> Vec<u8> {
     let mut out = Vec::with_capacity(EXPORT_MAGIC.len() + 64);
     out.extend_from_slice(EXPORT_MAGIC.as_bytes());
     out.extend_from_slice(&kdf.aad_bytes());
+    out
+}
+
+/// 附件段的 AAD:主体的 AAD + 固定分隔 + 标签。主体的 AAD 是它的真前缀,两者不会相等。
+fn part_aad(kdf: &KdfParams, label: &[u8]) -> Vec<u8> {
+    let mut out = aad_bytes(kdf);
+    out.extend_from_slice(b"/part/");
+    out.extend_from_slice(label);
     out
 }
 
@@ -118,5 +177,50 @@ mod tests {
         let back: EncryptedBundle = serde_json::from_str(&s).unwrap();
         let pt = open_with_password("p", &back).unwrap();
         assert_eq!(&*pt, b"data");
+    }
+
+    #[test]
+    fn session_round_trips_main_and_parts() {
+        let s = BackupSession::create("pw").unwrap();
+        let bundle = s.seal_main(b"items").unwrap();
+        let a = s.seal_part(b"att-a", b"file a").unwrap();
+        let b = s.seal_part(b"att-b", b"file b").unwrap();
+
+        let o = BackupSession::for_bundle("pw", &bundle).unwrap();
+        assert_eq!(&o.open_main(&bundle).unwrap()[..], b"items");
+        assert_eq!(&o.open_part(b"att-a", &a).unwrap()[..], b"file a");
+        assert_eq!(&o.open_part(b"att-b", &b).unwrap()[..], b"file b");
+        // 老接口读新会话写的主体:格式没变
+        assert_eq!(&open_with_password("pw", &bundle).unwrap()[..], b"items");
+    }
+
+    /// 两个附件对调、附件冒充主体、主体冒充附件,都解不开。
+    #[test]
+    fn parts_are_bound_to_their_label_and_role() {
+        let s = BackupSession::create("pw").unwrap();
+        let bundle = s.seal_main(b"items").unwrap();
+        let a = s.seal_part(b"att-a", b"file a").unwrap();
+        assert!(s.open_part(b"att-b", &a).is_err());
+        assert!(s.open_part(b"", &bundle.blob).is_err());
+        let mut forged = bundle.clone();
+        forged.blob = a;
+        assert!(s.open_main(&forged).is_err());
+    }
+
+    /// 附件挪到另一份备份里(同密码、不同盐)解不开。
+    #[test]
+    fn parts_do_not_open_under_another_backup() {
+        let s1 = BackupSession::create("pw").unwrap();
+        let s2 = BackupSession::create("pw").unwrap();
+        let a = s1.seal_part(b"att-a", b"file a").unwrap();
+        assert!(s2.open_part(b"att-a", &a).is_err());
+    }
+
+    #[test]
+    fn session_wrong_password_fails_at_open_main() {
+        let s = BackupSession::create("right").unwrap();
+        let bundle = s.seal_main(b"items").unwrap();
+        let o = BackupSession::for_bundle("wrong", &bundle).unwrap();
+        assert!(o.open_main(&bundle).is_err());
     }
 }

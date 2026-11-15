@@ -74,7 +74,9 @@ pub use account::{
     ACCOUNT_FORMAT_VERSION,
 };
 pub use error::{CryptoError, Result};
-pub use export::{open_with_password, seal_with_password, EncryptedBundle, EXPORT_MAGIC};
+pub use export::{
+    open_with_password, seal_with_password, BackupSession, EncryptedBundle, EXPORT_MAGIC,
+};
 pub use item::{decrypt_item, encrypt_item, rewrap_item_key, EncryptedItemBlob, ITEM_FORMAT_VERSION};
 pub use kdf::{
     derive_muk, KdfAlgorithm, KdfParams, DEFAULT_MEMORY_KIB, DEFAULT_PARALLELISM, DEFAULT_TIME_COST,
